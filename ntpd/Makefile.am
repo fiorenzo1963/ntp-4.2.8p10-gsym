@@ -278,6 +278,7 @@ libntpd_a_SOURCES =		\
 	refclock_wwvb.c		\
 	refclock_zyfer.c	\
 	refclock_tsyncpci.c	\
+	refclock_gpssymm.c	\
 	$(NULL)
 
 k-g-u-submake: keyword-gen

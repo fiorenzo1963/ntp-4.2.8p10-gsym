@@ -508,6 +508,7 @@ struct peer {
 #define REFCLK_ATOM_PPS		22	/* 1-PPS Clock Discipline */
 #define REFCLK_PTB_ACTS		23	/* replaced by REFCLK_ACTS */
 #define REFCLK_USNO		24	/* replaced by REFCLK_ACTS */
+#define REFCLK_GPS_SYMM		25	/* GPS disciplined Symmetricom Board */
 #define REFCLK_GPS_HP		26	/* HP 58503A Time/Frequency Receiver */
 #define REFCLK_ARCRON_MSF	27	/* ARCRON MSF radio clock. */
 #define REFCLK_SHM		28	/* clock attached thru shared memory */

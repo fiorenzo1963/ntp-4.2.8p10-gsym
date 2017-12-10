@@ -983,6 +983,7 @@ enable_ARBITER
 enable_ARCRON_MSF
 enable_AS2201
 enable_ATOM
+enable_GPSSYM
 enable_CHRONOLOG
 enable_CHU
 enable_AUDIO_CHU
@@ -1748,6 +1749,7 @@ Optional Features and Packages:
   --enable-ARCRON-MSF     + Arcron MSF receiver
   --enable-AS2201         + Austron 2200A/2201A GPS receiver
   --enable-ATOM           s ATOM PPS interface
+  --enable-GPSSYM         s GPS Disciplined Symmetricom BC635
   --enable-CHRONOLOG      + Chrono-log K-series WWVB receiver
   --enable-CHU            + CHU modem/decoder
   --enable-AUDIO-CHU      s CHU audio/decoder
@@ -28851,6 +28853,30 @@ case "$ntp_ok" in
     ntp_refclock=yes
 
 $as_echo "#define CLOCK_ATOM 1" >>confdefs.h
+
+    ;;
+esac
+{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $ntp_ok" >&5
+$as_echo "$ntp_ok" >&6; }
+
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking GPSSYM interface" >&5
+$as_echo_n "checking GPSSYM interface... " >&6; }
+# Check whether --enable-GPSSYM was given.
+if test "${enable_GPSSYM+set}" = set; then :
+  enableval=$enable_GPSSYM; ntp_ok=$enableval
+else
+  ntp_ok=$ntp_eac
+
+fi
+
+case "$ntp_ok" in
+ no) ntp_ok=no ;;
+esac
+case "$ntp_ok" in
+ yes)
+    ntp_refclock=yes
+
+$as_echo "#define CLOCK_GPSSYM 1" >>confdefs.h
 
     ;;
 esac

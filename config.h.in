@@ -27,6 +27,9 @@
 /* PPS interface? */
 #undef CLOCK_ATOM
 
+/* GPS disciplined Symmetricom BC635 interface? */
+#undef CLOCK_GPSSYM
+
 /* Datum/Bancomm bc635/VME interface? */
 #undef CLOCK_BANC
 

@@ -132,10 +132,16 @@ extern	struct refclock refclock_nmea;
 #define	refclock_nmea	refclock_none
 #endif
 
-#if defined (CLOCK_ATOM) && defined(HAVE_PPSAPI)
+#if defined(CLOCK_ATOM) && defined(HAVE_PPSAPI)
 extern	struct refclock	refclock_atom;
 #else
 #define refclock_atom	refclock_none
+#endif
+
+#ifdef CLOCK_GPSSYM
+extern struct refclock refclock_gpssymm;
+#else
+#define refclock_gpssym	refclock_none
 #endif
 
 #ifdef CLOCK_HPGPS
@@ -295,7 +301,7 @@ struct refclock * const refclock_conf[] = {
 	&refclock_atom,		/* 22 REFCLK_ATOM_PPS */
 	&refclock_none,		/* 23 not used */
 	&refclock_none,		/* 24 not used */
-	&refclock_none,		/* 25 not used */
+	&refclock_gpssymm,	/* 25 REFCLK_GPS_SYMM */
 	&refclock_hpgps,	/* 26 REFCLK_GPS_HP */
 	&refclock_arc, 		/* 27 REFCLK_ARCRON_MSF */
 	&refclock_shm,		/* 28 REFCLK_SHM */
