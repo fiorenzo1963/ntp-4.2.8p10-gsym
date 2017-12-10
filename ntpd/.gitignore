@@ -1,1 +1,5 @@
 complete.conf
+ntp.conf.5
+ntp.keys.5
+ntpd
+ntpd.8

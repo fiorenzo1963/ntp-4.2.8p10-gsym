@@ -1,8 +1,16 @@
 Makefile
 .deps
+.deps-ver
+.gcc-warning
 config.h
 config.log
 config.status
 libtool
 stamp-h1
+.version
+version.c
+check-*
+*.la
+*.lo
+*.a
 *.o
