@@ -1,11 +1,44 @@
 /*
  * refclock_gpssymm.c - clock driver GPS disciplined symmetricomm BC635-PCI
  *                      (uses GPS 1PPS as input to 1PPS to BC635-PCI)
- * Fio Cattaneo <fio@cattaneo.us>
- * Nov 24, 2017
+ *
+ * Fio Cattaneo <fio@cattaneo.us>, Nov 24, 2017
  *
  * based on refclock_nmea.c
+ *
+ *
  */
+/*
+***********************************************************************
+*                                                                     *
+* Copyright (c) Fio Cattaneo 2017                                     *
+*                                                                     *
+* All Rights Reserved                                                 *
+*                                                                     *
+* Redistribution and use in source and binary forms, with or without  *
+* modification, are permitted provided that the following conditions  *
+* are met:                                                            *
+* 1. Redistributions of source code must retain the above copyright   *
+*    notice, this list of conditions and the following disclaimer.    *
+* 2. Redistributions in binary form must reproduce the above          *
+*    copyright notice, this list of conditions and the following      *
+*    disclaimer in the documentation and/or other materials provided  *
+*    with the distribution.                                           *
+*                                                                     *
+* THIS SOFTWARE IS PROVIDED BY THE AUTHORS ``AS IS'' AND ANY EXPRESS  *
+* OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED   *
+* WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE  *
+* ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHORS OR CONTRIBUTORS BE    *
+* LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR *
+* CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT   *
+* OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR  *
+* BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF          *
+* LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT           *
+* (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE   *
+* USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH    *
+* DAMAGE.                                                             *
+***********************************************************************
+*/
 
 #ifdef HAVE_CONFIG_H
 #include <config.h>
@@ -31,19 +64,22 @@
 #include "timespecops.h"
 
 /*
- * This driver supports NMEA-compatible GPS receivers
  *
- * Prototype was refclock_trak.c, Thanks a lot.
+ * Prototype was refclock_nmea.c, Thanks a lot.
  *
- * The receiver used spits out the NMEA sentences for boat navigation.
- * And you thought it was an information superhighway.	Try a raging river
- * filled with rapids and whirlpools that rip away your data and warp time.
- *
- * GPS sentences other than RMC (the default) may be enabled by setting
- * the relevent bits of 'mode' in the server configuration line
- * server 127.127.20.x mode X
+ * server 127.127.25.0 mode X
  * 
- * bit 9 - enables NEO7 UBLOX
+ * bit 9/10 - gps receiver type
+ *            1 = NEO UBLOX7
+ *            2 = Garmin 18x
+ *            0 = Generic GPS receiver
+ *
+ * GPS receiver must be configured as follows:
+ * (1) output only GPRMC.
+ * (2) PPS enable rising edge for 100 to 200 milliseconds max,
+ *     do not output PPS if GPS lock is lost, or minimize it (garmin limits it to 1).
+ * (3) stationary mode (if available).
+ *
  *
  * bit 4/5/6 - selects the baudrate for serial port :
  *		0 for 4800 (default) 
@@ -53,14 +89,13 @@
  *		4 for 57600 
  *		5 for 115200 
  */
-#define NMEA_NEO7_UBLOX		0x00000100U
+#define NMEA_GPS_NEO7_UBLOX		0x00000100U
+#define NMEA_GPS_18X_GARMIN		0x00000200U
+#define NMEA_GPS_GENERIC		0x00000200U
+#define NMEA_GPS_MASK			0x00000F00U
 
 #define NMEA_BAUDRATE_MASK	0x00000070U
 #define NMEA_BAUDRATE_SHIFT	4
-
-#define NMEA_DELAYMEAS_MASK	0x80
-#define NMEA_EXTLOG_MASK	0x00010000U
-#define NMEA_DATETRUST_MASK	0x02000000U
 
 #define NMEA_PROTO_IDLEN	4	/* tag name must be at least 5 chars */
 #define NMEA_PROTO_MINLEN	6	/* min chars in sentence, excluding CS */
@@ -72,17 +107,49 @@
  * We only care about GPRMC (and PUBX for UBLOX NEO devices to determine if leap seconds are valid).
  * Note for UBLOX, we set stationary mode, so we do not velocity information.
  *
+ *
+ *
+ * ===================== GARMIN 18X ============================================
+ *
  * $GPRMC,hhmmss,a,fddmm.xx,n,dddmmm.xx,w,zz.z,yyy.,ddmmyy,dd,v*CC
- *
- * Garmin:
- *
+ * a =
+ * v =
  * $GPRMC,214403,A,4734.0198,N,12207.7026,W,000.1,043.1,251117,016.2,E,D*0E
  *
- * Ublox:
  *
+ * ===================== NEO UBLOX7 ============================================
+ *
+ * NEO UBLOX7:
+ *
+ * On UBLOX7, we must look for PUBX,04 message to make sure we are getting
+ * gps leap seconds from satellites, otherwise our time will be off
+ * (UBLOX7 firmware has a default of 16 seconds, currently it's 18 as of December 2017).
+ *
+ *
+ * $GPRMC,hhmmss.00,a,fddmm.xx,n,dddmmm.xx,w,zz.z,yyy.,ddmmyy,dd,v*CC
+ * a:
+ *     A = data valid
+ *     V = nav receiver warning
+ * v:
+ *     N = invalid
+ *     E = estimated
+ *     A = valid autonomous
+ *     D = valid differential
  * $GPRMC,214403.00,A,4734.01467,N,12207.70351,W,0.015,,251117,,,A*61
- * $PUBX,04,214403.00,251117,596642.99,1976,18,-693780,-471.533,21*15
  *
+ * (issued on demand, must send proprietary nmea PUBX,04 command)
+ * $PUBX,04,hhmmss.00,ddhhyy,
+ *                           gpsweek seconds offset,
+ *                           gpsweek(does not rollover),
+ *                           gps leapseconds
+ *                                 (marked with a 'D' suffix if the value
+ *                                  is the fw default value, otherwise it
+ *                                  is the actual leap seconds value received
+ *                                  from GPS constellation),
+ *                           receiver clock bias (ns),
+ *                           receiver clock driver (ns/s),
+ *                           time pulse granularity (ns)
+ * $PUBX,04,214403.00,251117,596642.99,1976,18,-693780,-471.533,21*15
  */
 
 /*
@@ -90,7 +157,7 @@
  */
 #define	GPS_DEVICE	"/dev/gps0"	/* GPS serial device */
 #define SYMM_DEVICE	"/dev/btfp0"	/* Symmetricom BC635 device */
-#define	SPEED232	B115200	/* uart speed (4800 bps) */
+#define	SPEED232	B38400	/* uart speed (38400 bps) fallback */
 #define	PRECISION	(-22)	/* precision assumed (about 0.125 us) */
 #define	PPS_PRECISION	(-22)	/* precision assumed (about 0.125 us) */
 #define	REFID		"GSYM"	/* reference id */
@@ -107,12 +174,6 @@
 #endif
 #define PPSOPENMODE	(O_RDWR | M_NOCTTY | M_NONBLOCK)
 
-/* date formats we support */
-enum date_fmt {
-	DATE_1_DDMMYY,	/* use 1 field	with 2-digit year */
-	DATE_3_DDMMYYYY	/* use 3 fields with 4-digit year */
-};
-
 /* results for 'field_init()'
  *
  * Note: If a checksum is present, the checksum test must pass OK or the
@@ -123,25 +184,59 @@ enum date_fmt {
 #define CHECK_VALID   1	/* valid but without checksum	*/
 #define CHECK_CSVALID 2	/* valid with checksum OK	*/
 
+enum gps_clockstate {
+	CS_INVALID_CLOCK,		/* wait valid GPRMC sentence */
+	CS_WAIT_CLOCK_LEAP_SECS,	/* for UBLOX7, wait for valid leap secs */
+	CS_VALID_CLOCK,			/* valid clock */
+};
+
+enum bc635_clockstate {
+	BCS_NOT_INITIALIZED,		/* not initialized yet */
+	BCS_INITIALIZED,		/* initialized */
+	BCS_PPS_SYNCHRONIZED,		/* initialized with PPS valid */
+	BCS_FREE_RUNNING,		/* free running (without PPS) */
+};
+
+#define YEAR_CENTURY	2000
+
 /*
  * Unit control structure
+ *
+ * the BC635 hardware has a 32 bit field for seconds time, so there is no need to
+ * worry about centuries, we are in 2017 and the BC635 will be obsolete in 2038
+ * (so this is why we can simply fix YEAR CENTURY to 2000).
  */
 typedef struct {
-	u_char  gps_time;	/* use GPS time, not UTC */
-	u_short century_cache;	/* cached current century */
-	l_fp	last_reftime;	/* last processed reference stamp */
-	short 	epoch_warp;	/* last epoch warp, for logging */
-	/* tally stats, reset each poll cycle */
-	struct
+	l_fp			last_reftime;	/* last processed reference stamp */
+	struct timespec 	last_t_reftime;
+	l_fp    		last_clocktime;	/* last clocktime matching ref stamp */
+	struct timespec 	last_t_clocktime;
+	enum gps_clockstate	gps_clock_state;
+	enum bc635_clockstate	gps_bc635_clock_state;
+	struct gps_tally
 	{
-		u_int total;
-		u_int accepted;
-		u_int rejected;   /* GPS said not enough signal */
-		u_int malformed;  /* Bad checksum, invalid date or time */
-		u_int filtered;   /* mode bits, not GPZDG, same second */
-		u_int pps_used;
-	}	
-		tally;
+		u_int total;             /* total packes */
+		u_int valid_ignored;     /* valid, but don't have correct time yet */
+		u_int valid_processed;   /* valid, accepted */
+		u_int invalid;
+	} gps_tally;
+	int			gps_mode_flags;		/* (ttl & NMEA_GPS_MASK) */
+	/*
+	 * the next four fields are only vaid if (gps_mode_flags & NMEA_GPS_NEO7_UBLOX) is true.
+	 */
+	int			gps_week_number;	/* gps week number, if available (does not rollover) */
+	int			gps_week_seconds;	/* gps week seconds, if available */
+	int			gps_leap_seconds;	/* gps leap seconds, if available */
+	struct timespec		gps_info_reftime;	/* when the above three fields were obtained, if available */
+	int			count;			/* count of received packets. */
+	/*
+	 * fd to access BC635
+	 */
+	int			bc635_fd;
+	/*
+	 * temporary fields being worked on.
+	 */
+	struct tm		gps_curr_tm;
 } gpssymm_unit;
 
 /*
@@ -155,31 +250,11 @@ typedef struct {
 } gpssymm_data;
 
 /*
- * NMEA gps week/time information
- * This record contains the number of weeks since 1980-01-06 modulo
- * 1024, the seconds elapsed since start of the week, and the number of
- * leap seconds that are the difference between GPS and UTC time scale.
- */
-typedef struct {
-	u_int32 wt_time;	/* seconds since weekstart */
-	u_short wt_week;	/* week number */
-	short	wt_leap;	/* leap seconds */
-} gps_weektm;
-
-/*
- * The GPS week time scale starts on Sunday, 1980-01-06. We need the
- * rata die number of this day.
- */
-#ifndef DAY_GPS_STARTS
-#define DAY_GPS_STARTS 722820
-#endif
-
-/*
  * Function prototypes
  */
 static	void	gpssymm_init	(void);
 static	int	gpssymm_start	(int, struct peer *);
-static	void	gpssymm_shutdown	(int, struct peer *);
+static	void	gpssymm_shutdown(int, struct peer *);
 static	void	gpssymm_receive	(struct recvbuf *);
 static	void	gpssymm_poll	(int, struct peer *);
 static	void	gpssymm_timer	(int, struct peer *);
@@ -189,25 +264,11 @@ static	void	gpssymm_control	(int, const struct refclockstat *, struct refclockst
 static int	field_init	(struct peer *peer, gpssymm_data * data, char * cp, int len);
 static char *	field_parse	(gpssymm_data * data, int fn);
 static void	field_wipe	(gpssymm_data * data, ...);
-static u_char	parse_qual	(gpssymm_data * data, int idx,
-				 char tag, int inv);
-static int	parse_time	(struct calendar * jd, long * nsec,
-				 gpssymm_data *, int idx);
-static int	parse_date	(struct calendar *jd, gpssymm_data*,
-				 int idx, enum date_fmt fmt);
-static int	parse_weekdata	(gps_weektm *, gpssymm_data *,
-				 int weekidx, int timeidx, int leapidx);
+static u_char	parse_qual	(gpssymm_data * data, int idx, char tag, int inv);
+static int	parse_time	(struct gpssymm_unit *gu, gpssymm_data *, int idx);
+static int	parse_date	(struct gpssymm_unit *gu, gpssymm_data*, int idx);
 /* calendar / date helpers */
-static int	unfold_day	(struct calendar * jd, u_int32 rec_ui);
-static int	unfold_century	(struct calendar * jd, u_int32 rec_ui);
-static int	gpsfix_century	(struct calendar * jd, const gps_weektm * wd,
-				 u_short * ccentury);
-static l_fp     eval_gps_time	(struct peer * peer, const struct calendar * gpst,
-				 const struct timespec * gpso, const l_fp * xrecv);
-
-static int	nmead_open	(const char * device);
-static void     save_ltc        (struct refclockproc * const, const char * const,
-				 size_t);
+static void     save_ltc        (struct refclockproc * const, const char * const, size_t);
 
 /*
  * If we want the driver to ouput sentences, too: re-enable the send
@@ -219,12 +280,6 @@ static	void gps_send(int, const char *, struct peer *);
 extern int async_write(int, const void *, unsigned int);
 #  define write(fd, data, octets)	async_write(fd, data, octets)
 # endif /* SYS_WINNT */
-
-static int32_t g_gpsMinBase;
-static int32_t g_gpsMinYear;
-
-#define NMEA_GPRMC	0
-#define NMEA_PUBX	1
 
 /*
  * -------------------------------------------------------------------
@@ -252,28 +307,7 @@ struct refclock refclock_gpssymm = {
 static void
 gpssymm_init(void)
 {
-	struct calendar date;
-
-	/* - calculate min. base value for GPS epoch & century unfolding 
-	 * This assumes that the build system was roughly in sync with
-	 * the world, and that really synchronising to a time before the
-	 * program was created would be unsafe or insane. If the build
-	 * date cannot be stablished, at least use the start of GPS
-	 * (1980-01-06) as minimum, because GPS can surely NOT
-	 * synchronise beyond it's own big bang. We add a little safety
-	 * margin for the fuzziness of the build date, which is in an
-	 * undefined time zone. */
-	if (ntpcal_get_build_date(&date))
-		g_gpsMinBase = ntpcal_date_to_rd(&date) - 2;
-	else
-		g_gpsMinBase = 0;
-
-	if (g_gpsMinBase < DAY_GPS_STARTS)
-		g_gpsMinBase = DAY_GPS_STARTS;
-
-	ntpcal_rd_to_date(&date, g_gpsMinBase);
-	g_gpsMinYear  = date.year;
-	g_gpsMinBase -= DAY_NTP_STARTS;
+	DPRINTF(1, ("gpssymm_init\n"));
 }
 
 /*
@@ -307,7 +341,7 @@ gpssymm_start(
 
 	switch (rate) {
 	case 0:
-		baudrate = SPEED232;
+		baudrate = B4800;
 		baudtext = "4800";
 		break;
 	case 1:
@@ -336,7 +370,7 @@ gpssymm_start(
 #endif
 	default:
 		baudrate = SPEED232;
-		baudtext = "4800 (fallback)";
+		baudtext = "38400 (fallback)";
 		break;
 	}
 
@@ -1149,15 +1183,6 @@ parse_date(
 		}
 		break;
 
-	case DATE_3_DDMMYYYY:
-		rc = sscanf(dp, "%2u,%2u,%4u%n", &d, &m, &y, &p);
-		if (rc != 3 || p != 10) {
-			DPRINTF(1, ("nmea: invalid date code: '%.10s'\n",
-				    dp));
-			return FALSE;
-		}
-		break;
-
 	default:
 		DPRINTF(1, ("nmea: invalid parse format: %d\n", fmt));
 		return FALSE;
@@ -1178,376 +1203,6 @@ parse_date(
 	return TRUE;
 }
 
-/*
- * -------------------------------------------------------------------
- * Parse GPS week time info from an NMEA sentence. This info contains
- * the GPS week number, the GPS time-of-week and the leap seconds GPS
- * to UTC.
- *
- * returns 1 on success, 0 on failure
- * -------------------------------------------------------------------
- */
-static int
-parse_weekdata(
-	gps_weektm * wd,
-	gpssymm_data  * rd,
-	int          weekidx,
-	int          timeidx,
-	int          leapidx
-	)
-{
-	u_long secs;
-	int    fcnt;
-
-	/* parse fields and count success */
-	fcnt  = sscanf(field_parse(rd, weekidx), "%hu", &wd->wt_week);
-	fcnt += sscanf(field_parse(rd, timeidx), "%lu", &secs);
-	fcnt += sscanf(field_parse(rd, leapidx), "%hd", &wd->wt_leap);
-	if (fcnt != 3 || wd->wt_week >= 1024 || secs >= 7*SECSPERDAY) {
-		DPRINTF(1, ("nmea: parse_weekdata: invalid weektime spec\n"));
-		return FALSE;
-	}
-	wd->wt_time = (u_int32)secs;
-
-	return TRUE;
-}
-
-/*
- * -------------------------------------------------------------------
- * funny calendar-oriented stuff -- perhaps a bit hard to grok.
- * -------------------------------------------------------------------
- *
- * Unfold a time-of-day (seconds since midnight) around the current
- * system time in a manner that guarantees an absolute difference of
- * less than 12hrs.
- *
- * This function is used for NMEA sentences that contain no date
- * information. This requires the system clock to be in +/-12hrs
- * around the true time, or the clock will synchronize the system 1day
- * off if not augmented with a time sources that also provide the
- * necessary date information.
- *
- * The function updates the calendar structure it also uses as
- * input to fetch the time from.
- *
- * returns 1 on success, 0 on failure
- * -------------------------------------------------------------------
- */
-static int
-unfold_day(
-	struct calendar * jd,
-	u_int32		  rec_ui
-	)
-{
-	vint64	     rec_qw;
-	ntpcal_split rec_ds;
-
-	/*
-	 * basically this is the peridiodic extension of the receive
-	 * time - 12hrs to the time-of-day with a period of 1 day.
-	 * But we would have to execute this in 64bit arithmetic, and we
-	 * cannot assume we can do this; therefore this is done
-	 * in split representation.
-	 */
-	rec_qw = ntpcal_ntp_to_ntp(rec_ui - SECSPERDAY/2, NULL);
-	rec_ds = ntpcal_daysplit(&rec_qw);
-	rec_ds.lo = ntpcal_periodic_extend(rec_ds.lo,
-					   ntpcal_date_to_daysec(jd),
-					   SECSPERDAY);
-	rec_ds.hi += ntpcal_daysec_to_date(jd, rec_ds.lo);
-	return (ntpcal_rd_to_date(jd, rec_ds.hi + DAY_NTP_STARTS) >= 0);
-}
-
-/*
- * -------------------------------------------------------------------
- * A 2-digit year is expanded into full year spec around the year found
- * in 'jd->year'. This should be in +79/-19 years around the system time,
- * or the result will be off by 100 years.  The assymetric behaviour was
- * chosen to enable inital sync for systems that do not have a
- * battery-backup clock and start with a date that is typically years in
- * the past.
- *
- * Since the GPS epoch starts at 1980-01-06, the resulting year will be
- * not be before 1980 in any case.
- *
- * returns 1 on success, 0 on failure
- * -------------------------------------------------------------------
- */
-static int
-unfold_century(
-	struct calendar * jd,
-	u_int32		  rec_ui
-	)
-{
-	struct calendar rec;
-	int32		baseyear;
-
-	ntpcal_ntp_to_date(&rec, rec_ui, NULL);
-	baseyear = rec.year - 20;
-	if (baseyear < g_gpsMinYear)
-		baseyear = g_gpsMinYear;
-	jd->year = (u_short)ntpcal_periodic_extend(baseyear, jd->year,
-						   100);
-
-	return ((baseyear <= jd->year) && (baseyear + 100 > jd->year));
-}
-
-/*
- * -------------------------------------------------------------------
- * A 2-digit year is expanded into a full year spec by correlation with
- * a GPS week number and the current leap second count.
- *
- * The GPS week time scale counts weeks since Sunday, 1980-01-06, modulo
- * 1024 and seconds since start of the week. The GPS time scale is based
- * on international atomic time (TAI), so the leap second difference to
- * UTC is also needed for a proper conversion.
- *
- * A brute-force analysis (that is, test for every date) shows that a
- * wrong assignment of the century can not happen between the years 1900
- * to 2399 when comparing the week signatures for different
- * centuries. (I *think* that will not happen for 400*1024 years, but I
- * have no valid proof. -*-perlinger@ntp.org-*-)
- *
- * This function is bound to to work between years 1980 and 2399
- * (inclusive), which should suffice for now ;-)
- *
- * Note: This function needs a full date&time spec on input due to the
- * necessary leap second corrections!
- *
- * returns 1 on success, 0 on failure
- * -------------------------------------------------------------------
- */
-static int
-gpsfix_century(
-	struct calendar  * jd,
-	const gps_weektm * wd,
-	u_short          * century
-	) 
-{
-	int32	days;
-	int32	doff;
-	u_short week;
-	u_short year;
-	int     loop;
-
-	/* Get day offset. Assumes that the input time is in range and
-	 * that the leap seconds do not shift more than +/-1 day.
-	 */
-	doff = ntpcal_date_to_daysec(jd) + wd->wt_leap;
-	doff = (doff >= SECSPERDAY) - (doff < 0);
-
-	/*
-	 * Loop over centuries to get a match, starting with the last
-	 * successful one. (Or with the 19th century if the cached value
-	 * is out of range...)
-	 */
-	year = jd->year % 100;
-	for (loop = 5; loop > 0; loop--,(*century)++) {
-		if (*century < 19 || *century >= 24)
-			*century = 19;
-		/* Get days and week in GPS epoch */
-		jd->year = year + *century * 100;
-		days = ntpcal_date_to_rd(jd) - DAY_GPS_STARTS + doff;
-		week = (days / 7) % 1024;
-		if (days >= 0 && wd->wt_week == week)
-			return TRUE; /* matched... */
-	}
-
-	jd->year = year;
-	return FALSE; /* match failed... */
-}
-
-/*
- * -------------------------------------------------------------------
- * And now the final execise: Considering the fact that many (most?)
- * GPS receivers cannot handle a GPS epoch wrap well, we try to
- * compensate for that problem by unwrapping a GPS epoch around the
- * receive stamp. Another execise in periodic unfolding, of course,
- * but with enough points to take care of.
- *
- * Note: The integral part of 'tofs' is intended to handle small(!)
- * systematic offsets, as -1 for handling $GPZDG, which gives the
- * following second. (sigh...) The absolute value shall be less than a
- * day (86400 seconds).
- * -------------------------------------------------------------------
- */
-static l_fp
-eval_gps_time(
-	struct peer           * peer, /* for logging etc */
-	const struct calendar * gpst, /* GPS time stamp  */
-	const struct timespec * tofs, /* GPS frac second & offset */
-	const l_fp            * xrecv /* receive time stamp */
-	)
-{
-	struct refclockproc * const pp = peer->procptr;
-	gpssymm_unit	    * const up = (gpssymm_unit *)pp->unitptr;
-
-	l_fp    retv;
-
-	/* components of calculation */
-	int32_t rcv_sec, rcv_day; /* receive ToD and day */
-	int32_t gps_sec, gps_day; /* GPS ToD and day in NTP epoch */
-	int32_t adj_day, weeks;   /* adjusted GPS day and week shift */
-
-	/* some temporaries to shuffle data */
-	vint64       vi64;
-	ntpcal_split rs64;
-
-	/* evaluate time stamp from receiver. */
-	gps_sec = ntpcal_date_to_daysec(gpst);
-	gps_day = ntpcal_date_to_rd(gpst) - DAY_NTP_STARTS;
-
-	/* merge in fractional offset */
-	retv = tspec_intv_to_lfp(*tofs);
-	gps_sec += retv.l_i;
-
-	/* If we fully trust the GPS receiver, just combine days and
-	 * seconds and be done. */
-	if (peer->ttl & NMEA_DATETRUST_MASK) {
-		retv.l_ui = ntpcal_dayjoin(gps_day, gps_sec).D_s.lo;
-		return retv;
-	}
-
-	/* So we do not trust the GPS receiver to deliver a correct date
-	 * due to the GPS epoch changes. We map the date from the
-	 * receiver into the +/-512 week interval around the receive
-	 * time in that case. This would be a tad easier with 64bit
-	 * calculations, but again, we restrict the code to 32bit ops
-	 * when possible. */
-
-	/* - make sure the GPS fractional day is normalised
-	 * Applying the offset value might have put us slightly over the
-	 * edge of the allowed range for seconds-of-day. Doing a full
-	 * division with floor correction is overkill here; a simple
-	 * addition or subtraction step is sufficient. Using WHILE loops
-	 * gives the right result even if the offset exceeds one day,
-	 * which is NOT what it's intented for! */
-	while (gps_sec >= SECSPERDAY) {
-		gps_sec -= SECSPERDAY;
-		gps_day += 1;
-	}
-	while (gps_sec < 0) {
-		gps_sec += SECSPERDAY;
-		gps_day -= 1;
-	}
-
-	/* - get unfold base: day of full recv time - 512 weeks */
-	vi64 = ntpcal_ntp_to_ntp(xrecv->l_ui, NULL);
-	rs64 = ntpcal_daysplit(&vi64);
-	rcv_sec = rs64.lo;
-	rcv_day = rs64.hi - 512 * 7;
-
-	/* - take the fractional days into account
-	 * If the fractional day of the GPS time is smaller than the
-	 * fractional day of the receive time, we shift the base day for
-	 * the unfold by 1. */
-	if (   gps_sec  < rcv_sec
-	   || (gps_sec == rcv_sec && retv.l_uf < xrecv->l_uf))
-		rcv_day += 1;
-
-	/* - don't warp ahead of GPS invention! */
-	if (rcv_day < g_gpsMinBase)
-		rcv_day = g_gpsMinBase;
-
-	/* - let the magic happen: */
-	adj_day = ntpcal_periodic_extend(rcv_day, gps_day, 1024*7);
-
-	/* - check if we should log a GPS epoch warp */
-	weeks = (adj_day - gps_day) / 7;
-	if (weeks != up->epoch_warp) {
-		up->epoch_warp = weeks;
-		LOGIF(CLOCKINFO, (LOG_INFO,
-				  "%s Changed GPS epoch warp to %d weeks",
-				  refnumtoa(&peer->srcadr), weeks));
-	}
-
-	/* - build result and be done */
-	retv.l_ui = ntpcal_dayjoin(adj_day, gps_sec).D_s.lo;
-	return retv;
-}
-
-/*
- * ===================================================================
- *
- * NMEAD support
- *
- * original nmead support added by Jon Miner (cp_n18@yahoo.com)
- *
- * See http://home.hiwaay.net/~taylorc/gps/nmea-server/
- * for information about nmead
- *
- * To use this, you need to create a link from /dev/gpsX to
- * the server:port where nmead is running.  Something like this:
- *
- * ln -s server:port /dev/gps1
- *
- * Split into separate function by Juergen Perlinger
- * (perlinger-at-ntp-dot-org)
- *
- * ===================================================================
- */
-static int
-nmead_open(
-	const char * device
-	)
-{
-	int	fd = -1;		/* result file descriptor */
-	
-#ifdef HAVE_READLINK
-	char	host[80];		/* link target buffer	*/
-	char  * port;			/* port name or number	*/
-	int	rc;			/* result code (several)*/
-	int     sh;			/* socket handle	*/
-	struct addrinfo	 ai_hint;	/* resolution hint	*/
-	struct addrinfo	*ai_list;	/* resolution result	*/
-	struct addrinfo *ai;		/* result scan ptr	*/
-
-	fd = -1;
-	
-	/* try to read as link, make sure no overflow occurs */
-	rc = readlink(device, host, sizeof(host));
-	if ((size_t)rc >= sizeof(host))
-		return fd;	/* error / overflow / truncation */
-	host[rc] = '\0';	/* readlink does not place NUL	*/
-
-	/* get port */
-	port = strchr(host, ':');
-	if (!port)
-		return fd; /* not 'host:port' syntax ? */
-	*port++ = '\0';	/* put in separator */
-	
-	/* get address infos and try to open socket
-	 *
-	 * This getaddrinfo() is naughty in ntpd's nonblocking main
-	 * thread, but you have to go out of your wary to use this code
-	 * and typically the blocking is at startup where its impact is
-	 * reduced. The same holds for the 'connect()', as it is
-	 * blocking, too...
-	 */
-	ZERO(ai_hint);
-	ai_hint.ai_protocol = IPPROTO_TCP;
-	ai_hint.ai_socktype = SOCK_STREAM;
-	if (getaddrinfo(host, port, &ai_hint, &ai_list))
-		return fd;
-	
-	for (ai = ai_list; ai && (fd == -1); ai = ai->ai_next) {
-		sh = socket(ai->ai_family, ai->ai_socktype,
-			    ai->ai_protocol);
-		if (INVALID_SOCKET == sh)
-			continue;
-		rc = connect(sh, ai->ai_addr, ai->ai_addrlen);
-		if (-1 != rc)
-			fd = sh;
-		else
-			close(sh);
-	}
-	freeaddrinfo(ai_list);
-#else
-	fd = -1;
-#endif
-
-	return fd;
-}
 #else
 NONEMPTY_TRANSLATION_UNIT
-#endif /* REFCLOCK && CLOCK_NMEA */
+#endif /* REFCLOCK && CLOCK_GPSSYM */
