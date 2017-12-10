@@ -1,0 +1,4 @@
+libevent.pc
+libevent_openssl.pc
+libevent_pthreads.pc
+stamp-h2
