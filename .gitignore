@@ -1,4 +1,5 @@
 Makefile
+COPYRIGHT
 .deps
 .deps-ver
 .gcc-warning
