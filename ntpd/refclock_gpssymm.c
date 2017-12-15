@@ -66,6 +66,9 @@
 #include "ntp_calendar.h"
 #include "timespecops.h"
 
+#include "ppsapi_timepps.h"
+#include "refclock_atom.h"
+
 #include "bc635_btfp.h"
 
 /*
@@ -168,7 +171,7 @@
 #define	GPS_DEVICE	"/dev/gps0"	/* GPS serial device */
 #define SYMM_DEVICE	"/dev/btfp0"	/* Symmetricom BC635 device */
 #define	DEF_GPS_RS232	B38400	/* uart speed (38400 bps) fallback */
-#define	PRECISION	(-19)	/* precision assumed without PPS (about 1 us) */
+#define	FREE_PRECISION	(-19)	/* precision assumed without PPS (about 1 us) */
 #define	PPS_PRECISION	(-21)	/* precision assumed with PPS activre (about 0.250 us) */
 #define	REFID		"GSYM"	/* reference id */
 #define	DESCRIPTION	"GPS Disciplined Symmetricom BC635 Clock" /* who we are */
@@ -218,6 +221,7 @@ enum bc635_clockstate {
  * (so this is why we can simply fix YEAR CENTURY to 2000).
  */
 typedef struct {
+	struct refclock_atom    atom;		/* atom.ts = PPS timespec */
 	l_fp			last_reftime;	/* last processed reference stamp */
 	struct timespec 	last_t_reftime;
 	l_fp    		last_clocktime;	/* last clocktime matching ref stamp */
@@ -408,7 +412,7 @@ gpssymm_start(
 	ZERO(up->gps_tally);
 
 	/* Initialize miscellaneous variables */
-	peer->precision = PRECISION;
+	peer->precision = FREE_PRECISION;
 	pp->clockdesc = DESCRIPTION;
 	memcpy(&pp->refid, REFID, 4);
 
@@ -573,10 +577,6 @@ gpssymm_timer(
 	struct refclockproc * const pp = peer->procptr;
 
 	UNUSED_ARG(unit);
-
-	if (-1 != pp->io.fd)
-		gps_send(pp->io.fd, "$PUBX,04*37\r\n", peer);
-	
 	UNUSED_ARG(unit);
 	UNUSED_ARG(peer);
 }
@@ -682,6 +682,7 @@ gpssymm_receive(
 	case CHECK_EMPTY:
 		DPRINTF(1, ("%s gpsread: empty: '%s'\n",
 			refnumtoa(&peer->srcadr), rd_lastcode));
+		refclock_report(peer, CEVNT_TIMEOUT);
 		up->gps_tally.invalid++;
 		return;
 
@@ -699,27 +700,31 @@ gpssymm_receive(
 	 * field has at least 5 chars we can simply shift the field
 	 * start.
 	 */
+	sentence = 0;
 	cp = field_parse(&rdata, 0);
-	if      (strncmp(cp, "GPRMC,", 6) == 0)
+	if (strncmp(cp, "GPRMC,", 6) == 0) {
 		sentence = NMEA_GPRMC;
-	else if (strncmp(cp, "PUBX,", 5) == 0)
+	} else if (strncmp(cp, "PUBX,", 5) == 0) {
 		sentence = NMEA_PUBX;
-	else {
+	} else {
 		DPRINTF(1, ("%s unknown timecode '%s', not processing\n",
 			refnumtoa(&peer->srcadr), rd_lastcode));
 		up->gps_tally.invalid++;
 		return;	/* not something we know about */
 	}
 
-	DPRINTF(1, ("%s processing %d bytes, timecode '%s'\n",
-		refnumtoa(&peer->srcadr), rd_lencode, rd_lastcode));
+	DPRINTF(1, ("%s gps_clock_state=%d, bc635_clock_state=%d, len=%d, timecode '%s'\n",
+		refnumtoa(&peer->srcadr),
+		up->gps_clock_state,
+		up->bc635_clock_state,
+		rd_lencode,
+		rd_lastcode));
 
 	/*
 	 * Grab fields depending on clock string type and possibly wipe
 	 * sensitive data from the last timecode.
 	 */
 	switch (sentence) {
-
 	case NMEA_GPRMC:
 		DPRINTF(1, ("%s processing GPRMC, timecode '%s'\n",
 			refnumtoa(&peer->srcadr), rd_lastcode));
@@ -727,11 +732,129 @@ gpssymm_receive(
 		rc_time	 = parse_time(&gps_curr_tm, &gps_curr_ns_offset, &rdata, 1);
 		pp->leap = parse_qual(&rdata, 2, 'A', 0);
 		rc_date	 = parse_date(&gps_curr_tm, &rdata, 9);
+
+		/* Check sanity of time-of-day. */
+		if (rc_time == 0) {	/* no time or conversion error? */
+			checkres = CEVNT_BADTIME;
+			up->gps_tally.malformed++;
+		}
+		/* Check sanity of date. */
+		else if (rc_date == 0) {/* no date or conversion error? */
+			checkres = CEVNT_BADDATE;
+			up->gps_tally.malformed++;
+		}
+		/* check clock sanity */
+		else if (pp->leap == LEAP_NOTINSYNC) { /* no good status? */
+			checkres = CEVNT_BADREPLY;
+			up->gps_tally.nofix++;
+		} else {
+			checkres = 0;
+		}
+		if (checkres != 0) {
+			DPRINTF(1, ("%s processing GPRMC, bad timecode '%s': #%d\n",
+				refnumtoa(&peer->srcadr), rd_lastcode, checkres));
+			up->gps_clock_state = CS_INVALID_CLOCK;
+			DPRINTF(1, ("%s set gps_clockstate to INVALID_CLOCK\n",
+				refnumtoa(&peer->srcadr)));
+			if (up->bc635_clock_state == BCS_TIME_PPS_SYNCHRONIZED) {
+				DPRINTF(1, ("%s downgrade bc635_clockstate from PPS_SYNCHRONIZED to FREE_RUNNING\n",
+					refnumtoa(&peer->srcadr)));
+				up->bc635_clock_state = BCS_TIME_FREE_RUNNING;
+				peer->precision = FREE_PRECISION;
+			} else
+				up->bc635_clock_state = BCS_PRE_INITIALIZED;
+			refclock_report(peer, checkres);
+			return;
+		}
+		/*
+		 * time is good, now check if we have/need leap seconds.
+		 * the UBLOX unit will not report correct time if it hasn't acquired leap seconds.
+		 */
+		if (up->gps_leap_seconds == 0 && up->gps_type == NMEA_GPS_NEO7_UBLOX) {
+			DPRINTF(1, ("%s UBLOX7 and no leap seconds yet, sending PUBX,04 request\n",
+				refnumtoa(&peer->srcadr)));
+			up->gps_clock_state = CS_WAIT_CLOCK_LEAP_SECS;
+			gps_send(pp->io.fd, "$PUBX,04*37\r\n", peer);
+			refclock_report(peer, CEVNT_TIMEOUT);
+			return;
+		} else {
+			DPRINTF(1, ("%s has valid gps clock\n",
+				refnumtoa(&peer->srcadr)));
+			up->gps_clock_state = CS_VALID_CLOCK;
+		}
+
 		break;
 
 	case NMEA_PUBX:
 		DPRINTF(1, ("%s processing PUBX, timecode '%s'\n",
 			refnumtoa(&peer->srcadr), rd_lastcode));
+		if (up->gps_clock_state == CS_WAIT_CLOCK_LEAP_SECS) {
+			float gps_week_secs;
+			char comma;
+			cp = field_parse(&rdata, 4);
+			if (sscanf(cp, "%f%c", &gps_week_secs, &comma) != 2 || comma != ',') {
+				DPRINTF(1, ("%s bad field for gps_week_seconds\n",
+					refnumtoa(&peer->srcadr)));
+				refclock_report(peer, CEVNT_TIMEOUT);
+				return;
+			}
+			up->gps_week_seconds = (int)ceil(gps_week_secs);
+			DPRINTF(1, ("%s gps_week_seconds = %d\n",
+				refnumtoa(&peer->srcadr), up->gps_week_seconds));
+			cp = field_parse(&rdata, 5);
+			if (sscanf(cp, "%d%c", &up->gps_week_number, &comma) != 2 || comma != ',') {
+				DPRINTF(1, ("%s bad field for gps_week_number\n",
+					refnumtoa(&peer->srcadr)));
+				refclock_report(peer, CEVNT_TIMEOUT);
+				return;
+			}
+			DPRINTF(1, ("%s gps_week_number = %d\n",
+				refnumtoa(&peer->srcadr), up->gps_week_number));
+			/*
+			 * week 1979 is when this code was written,
+			 * week 4152 is when Unix time overflows and the BC635 hardware stops
+			 * working (2038-01-17).
+			 */
+			if (up->gps_week_number < 1979 || up->gps_week_number >= 4152) {
+				DPRINTF(1, ("%s illegal value for gps_week_number\n",
+					refnumtoa(&peer->srcadr)));
+				refclock_report(peer, CEVNT_TIMEOUT);
+				return;
+			}
+			cp = field_parse(&rdata, 6);
+			if (sscanf(cp, "%d%c", &up->gps_leap_seconds, &comma) != 2) {
+				DPRINTF(1, ("%s bad field for gps_leap_seconds\n",
+					refnumtoa(&peer->srcadr)));
+				refclock_report(peer, CEVNT_TIMEOUT);
+				return;
+			}
+			DPRINTF(1, ("%s gps_leap_seconds = %d\n",
+				refnumtoa(&peer->srcadr), up->gps_leap_seconds));
+			if (comma == 'D') {
+				DPRINTF(1, ("%s gps_leap_seconds is still stored firmware value\n",
+					refnumtoa(&peer->srcadr)));
+				refclock_report(peer, CEVNT_TIMEOUT);
+				return;
+			}
+			if (comma != ',') {
+				DPRINTF(1, ("%s unexpected character after leap seconds %c\n",
+					refnumtoa(&peer->srcadr), comma));
+				refclock_report(peer, CEVNT_TIMEOUT);
+				return;
+			}
+			DPRINTF(1, ("%s PUBX,04 valid, gps leap seconds %d - gps clock valid\n",
+				refnumtoa(&peer->srcadr), up->gps_leap_seconds));
+			clock_gettime(CLOCK_REALTIME, &up->gps_info_reftime);
+			/*
+			 * has valid clock
+			 */
+			up->gps_clock_state = CS_VALID_CLOCK;
+		} else {
+			DPRINTF(1, ("%s got PUBX,04 valid but was not waiting for it\n",
+				refnumtoa(&peer->srcadr)));
+			refclock_report(peer, CEVNT_TIMEOUT);
+			return;
+		}
 		break;
 		
 	default:
@@ -739,23 +862,7 @@ gpssymm_receive(
 		return;
 	}
 
-	return;
-
-	/* Check sanity of time-of-day. */
-	if (rc_time == 0) {	/* no time or conversion error? */
-		checkres = CEVNT_BADTIME;
-		up->gps_tally.malformed++;
-	}
-	/* Check sanity of date. */
-	else if (rc_date == 0) {/* no date or conversion error? */
-		checkres = CEVNT_BADDATE;
-		up->gps_tally.malformed++;
-	}
-	/* check clock sanity */
-	else if (pp->leap == LEAP_NOTINSYNC) { /* no good status? */
-		checkres = CEVNT_BADREPLY;
-		up->gps_tally.nofix++;
-	}
+#if 0
 	else
 		checkres = -1;
 
@@ -764,18 +871,47 @@ gpssymm_receive(
 		refclock_report(peer, checkres);
 		return;
 	}
+#endif
 
-	gps_unix_time = timegm(&gps_curr_tm);
+	/*
+	 * GPS clock now valid
+	 */
 
-	DPRINTF(1, ("%s effective timecode: %04u-%02u-%02u %02d:%02d:%02d [UNIX:%ld]\n",
+	DPRINTF(1, ("%s state after parsing: gps_clock_state=%d, bc635_clock_state=%d\n",
 		refnumtoa(&peer->srcadr),
-		gps_curr_tm.tm_year + YEAR_1900,
-		gps_curr_tm.tm_mon + 1,
-		gps_curr_tm.tm_mday,
-		gps_curr_tm.tm_hour,
-		gps_curr_tm.tm_min,
-		gps_curr_tm.tm_sec,
-		gps_unix_time));
+		up->gps_clock_state,
+		up->bc635_clock_state,
+		rd_lencode,
+		rd_lastcode));
+
+	INVARIANT(up->gps_clock_state == CS_VALID_CLOCK);
+
+	if (sentence == NMEA_GPRMC) {
+		gps_unix_time = timegm(&gps_curr_tm);
+
+		DPRINTF(1, ("%s effective timecode: %04u-%02u-%02u %02d:%02d:%02d [UNIX:%ld]\n",
+			refnumtoa(&peer->srcadr),
+			gps_curr_tm.tm_year + YEAR_1900,
+			gps_curr_tm.tm_mon + 1,
+			gps_curr_tm.tm_mday,
+			gps_curr_tm.tm_hour,
+			gps_curr_tm.tm_min,
+			gps_curr_tm.tm_sec,
+			gps_unix_time));
+	}
+
+	switch (up->bc635_clock_state) {
+	case BCS_PRE_INITIALIZED:
+		break;
+	case BCS_TIME_INITIALIZED:
+		break;
+	case BCS_TIME_PPS_SYNCHRONIZED:
+		break;
+	case BCS_TIME_FREE_RUNNING:
+		break;
+	default:
+		INVARIANT(0);
+	}
 
 	refclock_report(peer, CEVNT_TIMEOUT);
 	return;
@@ -800,8 +936,48 @@ gpssymm_receive(
 		    refnumtoa(&peer->srcadr), rd_lastcode));
 
 	/* Data will be accepted. Update stats & log data. */
+	up->tally.accepted++;
 	save_ltc(pp, rd_lastcode, rd_lencode);
 	pp->lastrec = rd_timestamp;
+
+#ifdef HAVE_PPSAPI
+	/*
+	 * If we have PPS running, we try to associate the sentence
+	 * with the last active edge of the PPS signal.
+	 */
+	if (up->ppsapi_lit)
+		switch (refclock_ppsrelate(
+				pp, &up->atom, &rd_reftime, &rd_timestamp,
+				pp->fudgetime1,	&rd_fudge))
+		{
+		case PPS_RELATE_PHASE:
+			up->ppsapi_gate = TRUE;
+			peer->precision = PPS_PRECISION;
+			peer->flags |= FLAG_PPS;
+			DPRINTF(2, ("%s PPS_RELATE_PHASE\n",
+				    refnumtoa(&peer->srcadr)));
+			up->tally.pps_used++;
+			break;
+			
+		case PPS_RELATE_EDGE:
+			up->ppsapi_gate = TRUE;
+			peer->precision = PPS_PRECISION;
+			DPRINTF(2, ("%s PPS_RELATE_EDGE\n",
+				    refnumtoa(&peer->srcadr)));
+			break;
+			
+		case PPS_RELATE_NONE:
+		default:
+			/*
+			 * Resetting precision and PPS flag is done in
+			 * 'nmea_poll', since it might be a glitch. But
+			 * at the end of the poll cycle we know...
+			 */
+			DPRINTF(2, ("%s PPS_RELATE_NONE\n",
+				    refnumtoa(&peer->srcadr)));
+			break;
+		}
+#endif /* HAVE_PPSAPI */
 
 	refclock_process_offset(pp, rd_reftime, rd_timestamp, rd_fudge);
 #endif
