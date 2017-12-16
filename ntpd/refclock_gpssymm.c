@@ -66,8 +66,10 @@
 #include "ntp_calendar.h"
 #include "timespecops.h"
 
+/*
 #include "ppsapi_timepps.h"
 #include "refclock_atom.h"
+*/
 
 #include "bc635_btfp.h"
 
@@ -170,8 +172,8 @@
 #define	GPS_DEVICE	"/dev/gps0"	/* GPS serial device */
 #define SYMM_DEVICE	"/dev/btfp0"	/* Symmetricom BC635 device */
 #define	DEF_GPS_RS232	B38400	/* uart speed (38400 bps) fallback */
-#define	FREE_PRECISION	(-19)	/* precision assumed without PPS (about 1 us) */
-#define	PPS_PRECISION	(-21)	/* precision assumed with PPS activre (about 0.250 us) */
+#define	FREE_PRECISION		(-19)	/* precision assumed without PPS (about 1 us) */
+#define	LOCKED_PRECISION	(-21)	/* precision assumed with PPS activre (about 0.250 us) */
 #define	REFID		"GSYM"	/* reference id */
 #define	DESCRIPTION	"GPS Disciplined Symmetricom BC635 Clock" /* who we are */
 #ifndef O_NOCTTY
@@ -222,7 +224,6 @@ enum bc635_clockstate {
  * (so this is why we can simply fix YEAR CENTURY to 2000).
  */
 typedef struct {
-	struct refclock_atom    atom;		/* atom.ts = PPS timespec */
 	l_fp			last_bc635_reftime;	/* last processed reference stamp */
 	struct timespec 	last_bc635_t_reftime;
 	l_fp    		last_clocktime;		/* last clocktime matching ref stamp */
@@ -239,7 +240,7 @@ typedef struct {
 		u_int invalid;           /* invalid sentence, or not recognized */
 		u_int malformed;         /* valid sentence, but values malformed */
 		u_int nofix;             /* no gps fix */
-		u_int bc_time_not_init;
+		u_int bc_time_processed;
 		u_int bc_time_pps_sync;
 		u_int bc_time_free_running;
 	} gps_tally;
@@ -584,6 +585,50 @@ gpssymm_timer(
 	UNUSED_ARG(peer);
 }
 
+static void get_bc635_time(struct peer * const peer,
+		           gpssymm_unit * const up,
+			   struct timespec *bc635_reftime_out,
+			   struct timespec *clock_reftime_out,
+			   int *locked)
+{	
+	int ret;
+	struct timespec t;
+	struct btfp_ioctl_gettime bt;
+
+	memset(&bt, 0, sizeof (bt));
+	ret = ioctl(up->bc635_fd, BTFP_READ_UNIX_TIME, &bt);
+	clock_gettime(CLOCK_REALTIME, &t);
+	DPRINTF(1, ("%s clock_state: %ld.%09ld: read_unix_time=%d\n", refnumtoa(&peer->srcadr), t.tv_sec, t.tv_nsec, ret));
+	INVARIANT(ret == 0);
+	/*
+	 * FIXME: check for timewarps
+	 */
+	DPRINTF(1, ("%s clock_state: current time=%ld.%09ld\n", refnumtoa(&peer->srcadr), t.tv_sec, t.tv_nsec));
+	DPRINTF(1, ("%s clock_state:       bt.bt0=%ld.%09ld\n", refnumtoa(&peer->srcadr), bt.t0.tv_sec, bt.t0.tv_nsec));
+	DPRINTF(1, ("%s clock_state:         time=%ld.%09ld\n", refnumtoa(&peer->srcadr), bt.time.tv_sec, bt.time.tv_nsec));
+	DPRINTF(1, ("%s clock_state:       locked=%d\n", refnumtoa(&peer->srcadr), bt.locked));
+	DPRINTF(1, ("%s clock_state:      freqoff=%d\n", refnumtoa(&peer->srcadr), bt.freqoff));
+	DPRINTF(1, ("%s clock_state:      ns_prec=%d\n", refnumtoa(&peer->srcadr), bt.ns_precision));
+	DPRINTF(1, ("%s clock_state:       bt.bt1=%ld.%09ld\n", refnumtoa(&peer->srcadr), bt.t1.tv_sec, bt.t1.tv_nsec));
+	*locked = bt.locked;
+
+	/* calculate bc635 reference time which matches bt1 */
+	t = sub_tspec(bt.t1, bt.t0);
+	INVARIANT(t.tv_sec == 0);
+	INVARIANT(t.tv_nsec > 0);
+	t.tv_nsec /= 2;
+	DPRINTF(1, ("%s clock_state:    halfdelay=%ld.%09ld\n", refnumtoa(&peer->srcadr), t.tv_sec, t.tv_nsec));
+	*bc635_reftime_out = add_tspec(bt.time, t);
+	DPRINTF(1, ("%s clock_state:  bt1_reftime=%ld.%09ld\n", refnumtoa(&peer->srcadr), bc635_reftime_out->tv_sec, bc635_reftime_out->tv_nsec));
+	/*
+	 * FIXME should add a random offset (srandom() % ns_granularity)
+	 */
+	DPRINTF(1, ("%s clock_state:          bt1=%ld.%09ld\n", refnumtoa(&peer->srcadr), bt.t1.tv_sec, bt.t1.tv_nsec));
+	*clock_reftime_out = bt.t1;
+	t = sub_tspec(*bc635_reftime_out, bt.t1);
+	DPRINTF(1, ("%s clock_state: bc635ref-bt1=%ld.%09ld\n", refnumtoa(&peer->srcadr), t.tv_sec, t.tv_nsec));
+}
+
 /*
  * -------------------------------------------------------------------
  * gpssymm_receive - receive data from the serial interface
@@ -620,6 +665,7 @@ gpssymm_receive(
 	int 	  ret;
 	union     btfp_ioctl_out btfp;
 	struct    btfp_ioctl_gettime bt;
+	int       locked;
 
 	/* working stuff */
 	/* struct calendar date;	** to keep & convert the time stamp */
@@ -884,6 +930,12 @@ gpssymm_receive(
 	 * GPS clock now valid
 	 */
 
+	/*
+	 *
+	 * FIXME: should recheck with GPS every now and then
+	 *
+	 */
+
 	DPRINTF(1, ("%s state after parsing: gps_clock_state=%d, bc635_clock_state=%d\n",
 		refnumtoa(&peer->srcadr),
 		up->gps_clock_state,
@@ -905,6 +957,8 @@ gpssymm_receive(
 		gps_curr_tm.tm_sec,
 		gps_unix_time));
 
+	up->gps_tally.bc_time_processed++;
+
 	switch (up->bc635_clock_state) {
 	case BCS_PRE_INITIALIZED:
 		DPRINTF(1, ("%s clock_state: PRE_INITIALIZED\n", refnumtoa(&peer->srcadr)));
@@ -922,135 +976,96 @@ gpssymm_receive(
 		up->bc635_clock_state = BCS_TIME_INITIALIZED;
 		up->bc635_time_initialized_count = 0;
 		up->bc635_time_locked_count = 0;
-		break;
+		refclock_report(peer, CEVNT_TIMEOUT);
+		return;
 	case BCS_TIME_INITIALIZED:
 		DPRINTF(1, ("%s clock_state: TIME_INITIALIZED, #%d, locked=#%d\n", refnumtoa(&peer->srcadr), up->bc635_time_initialized_count, up->bc635_time_locked_count));
-		memset(&bt, 0, sizeof (bt));
-		ret = ioctl(up->bc635_fd, BTFP_READ_UNIX_TIME, &bt);
-		clock_gettime(CLOCK_REALTIME, &t);
-		DPRINTF(1, ("%s clock_state: %ld.%09ld: read_unix_time=%d\n", refnumtoa(&peer->srcadr), t.tv_sec, t.tv_nsec, ret));
-		INVARIANT(ret == 0);
-		/*
-		 * FIXME: check for timewarps
-		 */
-		DPRINTF(1, ("%s clock_state: current time=%ld.%09ld\n", refnumtoa(&peer->srcadr), t.tv_sec, t.tv_nsec));
-		DPRINTF(1, ("%s clock_state:       bt.bt0=%ld.%09ld\n", refnumtoa(&peer->srcadr), bt.t0.tv_sec, bt.t0.tv_nsec));
-		DPRINTF(1, ("%s clock_state:         time=%ld.%09ld\n", refnumtoa(&peer->srcadr), bt.time.tv_sec, bt.time.tv_nsec));
-		DPRINTF(1, ("%s clock_state:       locked=%d\n", refnumtoa(&peer->srcadr), bt.locked));
-		DPRINTF(1, ("%s clock_state:      freqoff=%d\n", refnumtoa(&peer->srcadr), bt.freqoff));
-		DPRINTF(1, ("%s clock_state:      ns_prec=%d\n", refnumtoa(&peer->srcadr), bt.ns_precision));
-		DPRINTF(1, ("%s clock_state:       bt.bt1=%ld.%09ld\n", refnumtoa(&peer->srcadr), bt.t1.tv_sec, bt.t1.tv_nsec));
-
-		/* calculate bc635 reference time which matches bt1 */
-		bt1_bc635_reftime = sub_tspec(bt.t1, bt.t0);
-		INVARIANT(bt1_bc635_reftime.tv_sec == 0);
-		INVARIANT(bt1_bc635_reftime.tv_nsec > 0);
-		bt1_bc635_reftime.tv_nsec /= 2;
-		DPRINTF(1, ("%s clock_state:    halfdelay=%ld.%09ld\n", refnumtoa(&peer->srcadr), bt1_bc635_reftime.tv_sec, bt1_bc635_reftime.tv_nsec));
-		bt1_bc635_reftime = add_tspec(bt.time, bt1_bc635_reftime);
-		DPRINTF(1, ("%s clock_state:  bt1_reftime=%ld.%09ld\n", refnumtoa(&peer->srcadr), bt1_bc635_reftime.tv_sec, bt1_bc635_reftime.tv_nsec));
-		/*
-		 * FIXME should add a random offset (srandom() % ns_granularity)
-		 */
-		DPRINTF(1, ("%s clock_state:          bt1=%ld.%09ld\n", refnumtoa(&peer->srcadr), bt.t1.tv_sec, bt.t1.tv_nsec));
-		t = sub_tspec(bt1_bc635_reftime, bt.t1);
-		DPRINTF(1, ("%s clock_state: bc635ref-bt1=%ld.%09ld\n", refnumtoa(&peer->srcadr), t.tv_sec, t.tv_nsec));
+		get_bc635_time(peer,
+			       up,
+			       &up->last_bc635_t_reftime,
+			       &up->last_t_clocktime,
+			       &locked);
 
 		up->bc635_time_initialized_count++;
-		if (bt.locked) {
+		if (locked) {
 			up->bc635_time_locked_count++;
 		} else {
 			up->bc635_time_locked_count = 0;
 		}
 		if (up->bc635_time_locked_count >= BC635_MIN_LOCKED_COUNT) {
 			up->bc635_clock_state = BCS_TIME_PPS_SYNCHRONIZED;
-			/* fall through */
-			;
+			/* refclock_report(peer, CEVNT_NOMINAL); */
 		} else if (up->bc635_time_initialized_count >= BC635_MIN_LOCKED_COUNT * 3) {
 			DPRINTF(1, ("%s clock_state: LOCK TIMEOUT -- reset to beginning\n", refnumtoa(&peer->srcadr)));
 			up->gps_clock_state = CS_INVALID_CLOCK;
 			up->bc635_clock_state = BCS_PRE_INITIALIZED;
 			refclock_report(peer, CEVNT_TIMEOUT);
-			return;
 		}
+		return;
 	case BCS_TIME_PPS_SYNCHRONIZED:
-		DPRINTF(1, ("%s clock_state: PPS_SYNCHRONIZED\n", refnumtoa(&peer->srcadr)));
+		up->gps_tally.bc_time_pps_sync++;
+		DPRINTF(1, ("%s clock_state: PPS_SYNCHRONIZED #%d, locked=#%d\n", refnumtoa(&peer->srcadr), up->bc635_time_initialized_count, up->bc635_time_locked_count));
+		get_bc635_time(peer,
+			       up,
+			       &up->last_bc635_t_reftime,
+			       &up->last_t_clocktime,
+			       &locked);
+		if (locked) {
+			up->bc635_time_locked_count++;
+			peer->precision = LOCKED_PRECISION;
+		} else {
+			DPRINTF(1, ("%s clock_state: PPS_SYNCHRONIZED #%d, locked=#%d: lost lock, now freerunning\n", refnumtoa(&peer->srcadr), up->bc635_time_initialized_count, up->bc635_time_locked_count));
+			up->bc635_clock_state = BCS_TIME_FREE_RUNNING;
+			up->bc635_time_locked_count = 0;
+			peer->precision = FREE_PRECISION;
+		}
 		break;
 	case BCS_TIME_FREE_RUNNING:
+		up->gps_tally.bc_time_free_running++;
 		DPRINTF(1, ("%s clock_state: FREE_RUNNING\n", refnumtoa(&peer->srcadr)));
+		get_bc635_time(peer,
+			       up,
+			       &up->last_bc635_t_reftime,
+			       &up->last_t_clocktime,
+			       &locked);
+		if (locked) {
+			DPRINTF(1, ("%s clock_state: PPS_SYNCHRONIZED #%d, locked=#%d: regained lock, now pps_synchronized\n", refnumtoa(&peer->srcadr), up->bc635_time_initialized_count, up->bc635_time_locked_count));
+			up->bc635_time_locked_count++;
+			peer->precision = LOCKED_PRECISION;
+		} else {
+			up->bc635_clock_state = BCS_TIME_FREE_RUNNING;
+			up->bc635_time_locked_count = 0;
+			peer->precision = FREE_PRECISION;
+		}
 		break;
 	default:
 		INVARIANT(0);
 	}
 
-	refclock_report(peer, CEVNT_TIMEOUT);
-	return;
+	up->last_clocktime = tspec_stamp_to_lfp(up->last_t_clocktime);
+	up->last_bc635_reftime = tspec_stamp_to_lfp(up->last_bc635_t_reftime);
 
-#if 0
-	/*
-	 * Get the reference time stamp from the calendar buffer.
-	 * Process the new sample in the median filter and determine the
-	 * timecode timestamp, but only if the PPS is not in control.
-	 * Discard sentence if reference time did not change.
-	 */
-	rd_reftime = eval_gps_time(peer, &date, &tofs, &rd_timestamp);
-	if (L_ISEQU(&up->last_reftime, &rd_reftime)) {
-		/* Do not touch pp->a_lastcode on purpose! */
-		up->tally.filtered++;
-		return;
-	}
-	up->last_reftime = rd_reftime;
 	rd_fudge = pp->fudgetime2;
 
 	DPRINTF(1, ("%s using '%s'\n",
 		    refnumtoa(&peer->srcadr), rd_lastcode));
 
 	/* Data will be accepted. Update stats & log data. */
-	up->tally.accepted++;
 	save_ltc(pp, rd_lastcode, rd_lencode);
-	pp->lastrec = rd_timestamp;
+	pp->lastrec = up->last_clocktime;
 
-#ifdef HAVE_PPSAPI
-	/*
-	 * If we have PPS running, we try to associate the sentence
-	 * with the last active edge of the PPS signal.
-	 */
-	if (up->ppsapi_lit)
-		switch (refclock_ppsrelate(
-				pp, &up->atom, &rd_reftime, &rd_timestamp,
-				pp->fudgetime1,	&rd_fudge))
-		{
-		case PPS_RELATE_PHASE:
-			up->ppsapi_gate = TRUE;
-			peer->precision = PPS_PRECISION;
-			peer->flags |= FLAG_PPS;
-			DPRINTF(2, ("%s PPS_RELATE_PHASE\n",
-				    refnumtoa(&peer->srcadr)));
-			up->tally.pps_used++;
-			break;
-			
-		case PPS_RELATE_EDGE:
-			up->ppsapi_gate = TRUE;
-			peer->precision = PPS_PRECISION;
-			DPRINTF(2, ("%s PPS_RELATE_EDGE\n",
-				    refnumtoa(&peer->srcadr)));
-			break;
-			
-		case PPS_RELATE_NONE:
-		default:
-			/*
-			 * Resetting precision and PPS flag is done in
-			 * 'nmea_poll', since it might be a glitch. But
-			 * at the end of the poll cycle we know...
-			 */
-			DPRINTF(2, ("%s PPS_RELATE_NONE\n",
-				    refnumtoa(&peer->srcadr)));
-			break;
-		}
-#endif /* HAVE_PPSAPI */
+	/* peer->precision = PPS_PRECISION; */
+	peer->flags |= FLAG_PPS;
+	DPRINTF(1, ("%s PPS_RELATE_PHASE\n", refnumtoa(&peer->srcadr)));
 
-	refclock_process_offset(pp, rd_reftime, rd_timestamp, rd_fudge);
-#endif
+	DPRINTF(1, ("%s refclock_process_offset(%ld.%09ld, %ld.%09ld, %.3f)\n",
+		refnumtoa(&peer->srcadr),
+		lfp_uintv_to_tspec(up->last_bc635_reftime).tv_sec,
+		lfp_uintv_to_tspec(up->last_bc635_reftime).tv_nsec,
+		lfp_uintv_to_tspec(up->last_clocktime).tv_sec,
+		lfp_uintv_to_tspec(up->last_clocktime).tv_nsec,
+		rd_fudge));
+	refclock_process_offset(pp, up->last_bc635_reftime, up->last_clocktime, rd_fudge);
 }
 
 
@@ -1077,12 +1092,6 @@ gpssymm_poll(
 	DPRINTF(1, ("%s gpssymm_poll, unit=%d\n",
 		refnumtoa(&peer->srcadr), unit));
 
-	refclock_report(peer, CEVNT_TIMEOUT);
-
-	DPRINTF(1, ("%s gpssymm_poll, unit=%d -- reported timeout\n",
-		refnumtoa(&peer->srcadr), unit));
-
-	return;
 	
 	/*
 	 * Process median filter samples. If none received, declare a
@@ -1094,8 +1103,12 @@ gpssymm_poll(
 	 * the input data and keep the stats going.
 	 */
 	if (pp->coderecv == pp->codeproc) {
+		DPRINTF(1, ("%s gpssymm_poll, unit=%d -- reported timeout\n",
+			refnumtoa(&peer->srcadr), unit));
 		refclock_report(peer, CEVNT_TIMEOUT);
 	} else {
+		DPRINTF(1, ("%s gpssymm_poll, unit=%d -- reported receive\n",
+			refnumtoa(&peer->srcadr), unit));
 		pp->polls++;
 		pp->lastref = pp->lastrec;
 		refclock_receive(peer);
@@ -1119,7 +1132,7 @@ gpssymm_poll(
 		  up->gps_tally.invalid,
 		  up->gps_tally.malformed,
 		  up->gps_tally.nofix,
-		  up->gps_tally.bc_time_not_init,
+		  up->gps_tally.bc_time_processed,
 		  up->gps_tally.bc_time_pps_sync,
 		  up->gps_tally.bc_time_free_running);
 	} else {
