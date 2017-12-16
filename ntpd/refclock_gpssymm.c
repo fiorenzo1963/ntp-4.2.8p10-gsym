@@ -112,7 +112,6 @@
 #define NMEA_PROTO_MAXLEN	100	/* max chars in sentence, excluding CS */
 #define NMEA_PROTO_FIELDS	32	/* not official; limit on fields per record */
 
-
 #define NMEA_GPRMC		1
 #define NMEA_PUBX		2
 /*
@@ -213,6 +212,8 @@ enum bc635_clockstate {
 #define YEAR_CENTURY	2000
 #define YEAR_1900	1900
 
+#define BC635_MIN_LOCKED_COUNT		5
+
 /*
  * Unit control structure
  *
@@ -222,12 +223,14 @@ enum bc635_clockstate {
  */
 typedef struct {
 	struct refclock_atom    atom;		/* atom.ts = PPS timespec */
-	l_fp			last_reftime;	/* last processed reference stamp */
-	struct timespec 	last_t_reftime;
-	l_fp    		last_clocktime;	/* last clocktime matching ref stamp */
+	l_fp			last_bc635_reftime;	/* last processed reference stamp */
+	struct timespec 	last_bc635_t_reftime;
+	l_fp    		last_clocktime;		/* last clocktime matching ref stamp */
 	struct timespec 	last_t_clocktime;
 	enum gps_clockstate	gps_clock_state;
 	enum bc635_clockstate	bc635_clock_state;
+	int			bc635_time_initialized_count;
+	int			bc635_time_locked_count;
 	struct gps_tally
 	{
 		u_int total;             /* total packes */
@@ -408,7 +411,7 @@ gpssymm_start(
 	pp->io.srcclock = peer;
 	pp->io.datalen = 0;
 	/* force change detection on first valid message */
-	memset(&up->last_reftime, 0xFF, sizeof(up->last_reftime));
+	memset(&up->last_bc635_reftime, 0xFF, sizeof(up->last_bc635_reftime));
 	ZERO(up->gps_tally);
 
 	/* Initialize miscellaneous variables */
@@ -614,6 +617,9 @@ gpssymm_receive(
 	l_fp 	  rd_timestamp, rd_reftime;
 	int	  rd_lencode;
 	double	  rd_fudge;
+	int 	  ret;
+	union     btfp_ioctl_out btfp;
+	struct    btfp_ioctl_gettime bt;
 
 	/* working stuff */
 	/* struct calendar date;	** to keep & convert the time stamp */
@@ -627,6 +633,7 @@ gpssymm_receive(
 	int		rc_time;
 
 	struct timespec t;
+	struct timespec bt1_bc635_reftime;
 
 	struct tm	gps_curr_tm;
 	long		gps_curr_ns_offset = 0;
@@ -761,8 +768,9 @@ gpssymm_receive(
 					refnumtoa(&peer->srcadr)));
 				up->bc635_clock_state = BCS_TIME_FREE_RUNNING;
 				peer->precision = FREE_PRECISION;
-			} else
+			} else {
 				up->bc635_clock_state = BCS_PRE_INITIALIZED;
+			}
 			refclock_report(peer, checkres);
 			return;
 		}
@@ -852,11 +860,10 @@ gpssymm_receive(
 		} else {
 			DPRINTF(1, ("%s got PUBX,04 valid but was not waiting for it\n",
 				refnumtoa(&peer->srcadr)));
-			refclock_report(peer, CEVNT_TIMEOUT);
-			return;
 		}
-		break;
-		
+		refclock_report(peer, CEVNT_TIMEOUT);
+		return;
+
 	default:
 		INVARIANT(0);	/* Coverity 97123 */
 		return;
@@ -880,34 +887,97 @@ gpssymm_receive(
 	DPRINTF(1, ("%s state after parsing: gps_clock_state=%d, bc635_clock_state=%d\n",
 		refnumtoa(&peer->srcadr),
 		up->gps_clock_state,
-		up->bc635_clock_state,
-		rd_lencode,
-		rd_lastcode));
+		up->bc635_clock_state));
 
 	INVARIANT(up->gps_clock_state == CS_VALID_CLOCK);
 
-	if (sentence == NMEA_GPRMC) {
-		gps_unix_time = timegm(&gps_curr_tm);
+	INVARIANT(sentence == NMEA_GPRMC);
 
-		DPRINTF(1, ("%s effective timecode: %04u-%02u-%02u %02d:%02d:%02d [UNIX:%ld]\n",
-			refnumtoa(&peer->srcadr),
-			gps_curr_tm.tm_year + YEAR_1900,
-			gps_curr_tm.tm_mon + 1,
-			gps_curr_tm.tm_mday,
-			gps_curr_tm.tm_hour,
-			gps_curr_tm.tm_min,
-			gps_curr_tm.tm_sec,
-			gps_unix_time));
-	}
+	gps_unix_time = timegm(&gps_curr_tm);
+
+	DPRINTF(1, ("%s effective timecode: %04u-%02u-%02u %02d:%02d:%02d [UNIX:%ld]\n",
+		refnumtoa(&peer->srcadr),
+		gps_curr_tm.tm_year + YEAR_1900,
+		gps_curr_tm.tm_mon + 1,
+		gps_curr_tm.tm_mday,
+		gps_curr_tm.tm_hour,
+		gps_curr_tm.tm_min,
+		gps_curr_tm.tm_sec,
+		gps_unix_time));
 
 	switch (up->bc635_clock_state) {
 	case BCS_PRE_INITIALIZED:
+		DPRINTF(1, ("%s clock_state: PRE_INITIALIZED\n", refnumtoa(&peer->srcadr)));
+		/*
+		 * set UNIX time in BC635 board.
+		 */
+		memset(&btfp, 0, sizeof (btfp));
+		btfp.set_unixtime.unix_time = (uint32_t)gps_unix_time;
+		clock_gettime(CLOCK_REALTIME, &t);
+		DPRINTF(1, ("%s clock_state: %ld.%09ld: set_unix_time\n", refnumtoa(&peer->srcadr), t.tv_sec, t.tv_nsec));
+		ret = ioctl(up->bc635_fd, BTFP_WRITE_UNIX_TIME, &btfp);
+		clock_gettime(CLOCK_REALTIME, &t);
+		DPRINTF(1, ("%s clock_state: %ld.%09ld: set_unix_time=%d\n", refnumtoa(&peer->srcadr), t.tv_sec, t.tv_nsec, ret));
+		INVARIANT(ret == 0);
+		up->bc635_clock_state = BCS_TIME_INITIALIZED;
+		up->bc635_time_initialized_count = 0;
+		up->bc635_time_locked_count = 0;
 		break;
 	case BCS_TIME_INITIALIZED:
-		break;
+		DPRINTF(1, ("%s clock_state: TIME_INITIALIZED, #%d, locked=#%d\n", refnumtoa(&peer->srcadr), up->bc635_time_initialized_count, up->bc635_time_locked_count));
+		memset(&bt, 0, sizeof (bt));
+		ret = ioctl(up->bc635_fd, BTFP_READ_UNIX_TIME, &bt);
+		clock_gettime(CLOCK_REALTIME, &t);
+		DPRINTF(1, ("%s clock_state: %ld.%09ld: read_unix_time=%d\n", refnumtoa(&peer->srcadr), t.tv_sec, t.tv_nsec, ret));
+		INVARIANT(ret == 0);
+		/*
+		 * FIXME: check for timewarps
+		 */
+		DPRINTF(1, ("%s clock_state: current time=%ld.%09ld\n", refnumtoa(&peer->srcadr), t.tv_sec, t.tv_nsec));
+		DPRINTF(1, ("%s clock_state:       bt.bt0=%ld.%09ld\n", refnumtoa(&peer->srcadr), bt.t0.tv_sec, bt.t0.tv_nsec));
+		DPRINTF(1, ("%s clock_state:         time=%ld.%09ld\n", refnumtoa(&peer->srcadr), bt.time.tv_sec, bt.time.tv_nsec));
+		DPRINTF(1, ("%s clock_state:       locked=%d\n", refnumtoa(&peer->srcadr), bt.locked));
+		DPRINTF(1, ("%s clock_state:      freqoff=%d\n", refnumtoa(&peer->srcadr), bt.freqoff));
+		DPRINTF(1, ("%s clock_state:      ns_prec=%d\n", refnumtoa(&peer->srcadr), bt.ns_precision));
+		DPRINTF(1, ("%s clock_state:       bt.bt1=%ld.%09ld\n", refnumtoa(&peer->srcadr), bt.t1.tv_sec, bt.t1.tv_nsec));
+
+		/* calculate bc635 reference time which matches bt1 */
+		bt1_bc635_reftime = sub_tspec(bt.t1, bt.t0);
+		INVARIANT(bt1_bc635_reftime.tv_sec == 0);
+		INVARIANT(bt1_bc635_reftime.tv_nsec > 0);
+		bt1_bc635_reftime.tv_nsec /= 2;
+		DPRINTF(1, ("%s clock_state:    halfdelay=%ld.%09ld\n", refnumtoa(&peer->srcadr), bt1_bc635_reftime.tv_sec, bt1_bc635_reftime.tv_nsec));
+		bt1_bc635_reftime = add_tspec(bt.time, bt1_bc635_reftime);
+		DPRINTF(1, ("%s clock_state:  bt1_reftime=%ld.%09ld\n", refnumtoa(&peer->srcadr), bt1_bc635_reftime.tv_sec, bt1_bc635_reftime.tv_nsec));
+		/*
+		 * FIXME should add a random offset (srandom() % ns_granularity)
+		 */
+		DPRINTF(1, ("%s clock_state:          bt1=%ld.%09ld\n", refnumtoa(&peer->srcadr), bt.t1.tv_sec, bt.t1.tv_nsec));
+		t = sub_tspec(bt1_bc635_reftime, bt.t1);
+		DPRINTF(1, ("%s clock_state: bc635ref-bt1=%ld.%09ld\n", refnumtoa(&peer->srcadr), t.tv_sec, t.tv_nsec));
+
+		up->bc635_time_initialized_count++;
+		if (bt.locked) {
+			up->bc635_time_locked_count++;
+		} else {
+			up->bc635_time_locked_count = 0;
+		}
+		if (up->bc635_time_locked_count >= BC635_MIN_LOCKED_COUNT) {
+			up->bc635_clock_state = BCS_TIME_PPS_SYNCHRONIZED;
+			/* fall through */
+			;
+		} else if (up->bc635_time_initialized_count >= BC635_MIN_LOCKED_COUNT * 3) {
+			DPRINTF(1, ("%s clock_state: LOCK TIMEOUT -- reset to beginning\n", refnumtoa(&peer->srcadr)));
+			up->gps_clock_state = CS_INVALID_CLOCK;
+			up->bc635_clock_state = BCS_PRE_INITIALIZED;
+			refclock_report(peer, CEVNT_TIMEOUT);
+			return;
+		}
 	case BCS_TIME_PPS_SYNCHRONIZED:
+		DPRINTF(1, ("%s clock_state: PPS_SYNCHRONIZED\n", refnumtoa(&peer->srcadr)));
 		break;
 	case BCS_TIME_FREE_RUNNING:
+		DPRINTF(1, ("%s clock_state: FREE_RUNNING\n", refnumtoa(&peer->srcadr)));
 		break;
 	default:
 		INVARIANT(0);
