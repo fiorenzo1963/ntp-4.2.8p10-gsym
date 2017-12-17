@@ -331,6 +331,7 @@ static void
 gpssymm_init(void)
 {
 	DPRINTF(1, ("gpssymm_init\n"));
+	srandomdev();
 }
 
 /*
@@ -573,14 +574,8 @@ gpssymm_timer(
 	struct peer * peer
 	)
 {
-	struct timespec t;
-	clock_gettime(CLOCK_REALTIME, &t);
-	DPRINTF(1, ("%s gpssymm_timer: %ld.%09ld\n",
-		refnumtoa(&peer->srcadr), t.tv_sec, t.tv_nsec));
-    
-	struct refclockproc * const pp = peer->procptr;
+	/* struct refclockproc * const pp = peer->procptr; */
 
-	UNUSED_ARG(unit);
 	UNUSED_ARG(unit);
 	UNUSED_ARG(peer);
 }
@@ -606,8 +601,15 @@ static void get_bc635_time(struct peer * const peer,
 	DPRINTF(1, ("%s clock_state: current time=%ld.%09ld\n", refnumtoa(&peer->srcadr), t.tv_sec, t.tv_nsec));
 	DPRINTF(1, ("%s clock_state:       bt.bt0=%ld.%09ld\n", refnumtoa(&peer->srcadr), bt.t0.tv_sec, bt.t0.tv_nsec));
 	DPRINTF(1, ("%s clock_state:         time=%ld.%09ld\n", refnumtoa(&peer->srcadr), bt.time.tv_sec, bt.time.tv_nsec));
+	/*
+	 * add a random offset from 0 to (ns_precision - 1),
+	 * to compensate for the lack of the low nanoseconds.
+	 */
+	bt.time = add_tspec_ns(bt.time, (random() % bt.ns_precision));
+	DPRINTF(1, ("%s clock_state:     time(ns)=%ld.%09ld\n", refnumtoa(&peer->srcadr), bt.time.tv_sec, bt.time.tv_nsec));
 	DPRINTF(1, ("%s clock_state:       locked=%d\n", refnumtoa(&peer->srcadr), bt.locked));
 	DPRINTF(1, ("%s clock_state:      freqoff=%d\n", refnumtoa(&peer->srcadr), bt.freqoff));
+	DPRINTF(1, ("%s clock_state:      timeoff=%d\n", refnumtoa(&peer->srcadr), bt.timeoff));
 	DPRINTF(1, ("%s clock_state:      ns_prec=%d\n", refnumtoa(&peer->srcadr), bt.ns_precision));
 	DPRINTF(1, ("%s clock_state:       bt.bt1=%ld.%09ld\n", refnumtoa(&peer->srcadr), bt.t1.tv_sec, bt.t1.tv_nsec));
 	*locked = bt.locked;
@@ -619,7 +621,6 @@ static void get_bc635_time(struct peer * const peer,
 	t.tv_nsec /= 2;
 	DPRINTF(1, ("%s clock_state:    halfdelay=%ld.%09ld\n", refnumtoa(&peer->srcadr), t.tv_sec, t.tv_nsec));
 	*bc635_reftime_out = add_tspec(bt.time, t);
-	DPRINTF(1, ("%s clock_state:  bt1_reftime=%ld.%09ld\n", refnumtoa(&peer->srcadr), bc635_reftime_out->tv_sec, bc635_reftime_out->tv_nsec));
 	/*
 	 * FIXME should add a random offset (srandom() % ns_granularity)
 	 */
@@ -659,12 +660,11 @@ gpssymm_receive(
 	/* Use these variables to hold data until we decide its worth keeping */
 	gpssymm_data rdata;
 	char 	  rd_lastcode[BMAX];
-	l_fp 	  rd_timestamp, rd_reftime;
+	l_fp 	  rd_timestamp;
 	int	  rd_lencode;
 	double	  rd_fudge;
 	int 	  ret;
 	union     btfp_ioctl_out btfp;
-	struct    btfp_ioctl_gettime bt;
 	int       locked;
 
 	/* working stuff */
@@ -679,7 +679,6 @@ gpssymm_receive(
 	int		rc_time;
 
 	struct timespec t;
-	struct timespec bt1_bc635_reftime;
 
 	struct tm	gps_curr_tm;
 	long		gps_curr_ns_offset = 0;
