@@ -15,3 +15,5 @@ check-*
 *.lo
 *.a
 *.o
+*.core
+core

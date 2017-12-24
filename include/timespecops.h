@@ -119,6 +119,14 @@ normalize_tspec(
 	return x;
 }
 
+static inline long tspec_to_ns(struct timespec a)
+{
+	long res_ns;
+	res_ns = a.tv_sec * NANOSECONDS;
+	res_ns += a.tv_nsec;
+	return res_ns;
+}
+
 /* x = a + b */
 static inline struct timespec
 add_tspec(
@@ -218,7 +226,7 @@ abs_tspec(
 
 /*
  * compare previously-normalised a and b
- * return 1 / 0 / -1 if a < / == / > b
+ * return -1 / 0 / 1 if a < / == / > b
  */
 static inline int
 cmp_tspec(
@@ -238,7 +246,7 @@ cmp_tspec(
 
 /*
  * compare possibly-denormal a and b
- * return 1 / 0 / -1 if a < / == / > b
+ * return -1 / 0 / 1 if a < / == / > b
  */
 static inline int
 cmp_tspec_denorm(
@@ -251,7 +259,7 @@ cmp_tspec_denorm(
 
 /*
  * test previously-normalised a
- * return 1 / 0 / -1 if a < / == / > 0
+ * return -1 / 0 / 1 if a < / == / > 0
  */
 static inline int
 test_tspec(
