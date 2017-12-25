@@ -291,6 +291,7 @@ static	void	gpssymm_control	(int, const struct refclockstat *, struct refclockst
 static int	field_init	(struct peer *peer, gpssymm_data * data, char * cp, int len);
 static char *	field_parse	(gpssymm_data * data, int fn);
 static u_char	parse_qual	(gpssymm_data * data, int idx, char tag, int inv);
+static u_char	parse_qual2	(gpssymm_data * data, int idx, char tag, char tag2);
 static int	parse_time	(struct tm *t, long *ns_off, gpssymm_data *, int idx);
 static int	parse_date	(struct tm *t, gpssymm_data *, int idx);
 /* calendar / date helpers */
@@ -455,6 +456,22 @@ gpssymm_start(
 	      refnumtoa(&peer->srcadr), SYMM_DEVICE));
 
 	bzero(&btfp, sizeof (btfp));
+	btfp.timecodemodulation.id = TFP_CODE_MODULATION;
+	btfp.timecodemodulation.modulation = DCLS_PCM; /* 'D' DC level shift */
+	if (ioctl(up->bc635_fd, BTFP_CODE_MODULATION, &btfp) != 0) {
+		msyslog(LOG_ERR, "%s cannot set DC level timecode modulation for (%s)",
+			refnumtoa(&peer->srcadr),
+			SYMM_DEVICE);
+		io_closeclock(&pp->io);
+		pp->io.fd = -1;
+		close(up->bc635_fd);
+		up->bc635_fd = -1;
+		return FALSE;
+	}
+	LOGIF(CLOCKINFO, (LOG_NOTICE, "%s set timecode modulation to DC level for %s",
+	      refnumtoa(&peer->srcadr), SYMM_DEVICE));
+
+	bzero(&btfp, sizeof (btfp));
 	btfp.timemode.id = TFP_TIMEMODE;
 	btfp.timemode.mode = TIMEMODE_PPS;
 	if (ioctl(up->bc635_fd, BTFP_TIMEMODE, &btfp) != 0) {
@@ -517,6 +534,9 @@ gpssymm_shutdown(
 
 	DPRINTF(1, ("%s gpssymm_shutdown, unit=%d\n",
 		refnumtoa(&peer->srcadr), unit));
+
+	LOGIF(CLOCKINFO, (LOG_NOTICE, "%s shutdown for %s",
+	      refnumtoa(&peer->srcadr), SYMM_DEVICE));
 
 	UNUSED_ARG(unit);
 
@@ -670,6 +690,8 @@ static void get_bc635_time(struct peer * const peer,
 
 		local_clock_time = bt.t0;
 		DPRINTF(1, ("%s clock_state:     timewarp=%ld.%09ld\n", refnumtoa(&peer->srcadr), local_clock_time.tv_sec, local_clock_time.tv_nsec));
+		LOGIF(CLOCKINFO, (LOG_NOTICE, "%s timewarp event for %s",
+		      refnumtoa(&peer->srcadr), SYMM_DEVICE));
 	} else {
 		/*
 		 * no timewarp
@@ -779,6 +801,8 @@ gpssymm_receive(
 	long		gps_curr_ns_offset = 0;
 	time_t		gps_unix_time;
 
+	int		log_lastcode = 0;
+
 	/* make sure data has defined pristine state */
 	/*ZERO(tofs);*/
 	/*ZERO(date);*/
@@ -872,12 +896,14 @@ gpssymm_receive(
 	 */
 	switch (sentence) {
 	case NMEA_GPRMC:
-		DPRINTF(1, ("%s processing GPRMC, timecode '%s'\n",
-			refnumtoa(&peer->srcadr), rd_lastcode));
+		DPRINTF(1, ("%s processing GPRMC, rdata.base '%s'\n",
+			refnumtoa(&peer->srcadr), rdata.base));
 		/* Check quality byte, fetch data & time */
 		rc_time	 = parse_time(&gps_curr_tm, &gps_curr_ns_offset, &rdata, 1);
 		pp->leap = parse_qual(&rdata, 2, 'A', 0);
 		rc_date	 = parse_date(&gps_curr_tm, &rdata, 9);
+		if (pp->leap == LEAP_NOWARNING)
+			pp->leap = parse_qual2(&rdata, 12, 'A', 'D');
 
 		/* Check sanity of time-of-day. */
 		if (rc_time == 0) {	/* no time or conversion error? */
@@ -897,14 +923,19 @@ gpssymm_receive(
 			checkres = 0;
 		}
 		if (checkres != 0) {
-			DPRINTF(1, ("%s processing GPRMC, bad timecode '%s': #%d\n",
-				refnumtoa(&peer->srcadr), rd_lastcode, checkres));
+			DPRINTF(1, ("%s processing GPRMC, bad rdata.base '%s': #%d\n",
+				refnumtoa(&peer->srcadr), rdata.base, checkres));
 			up->gps_clock_state = CS_INVALID_CLOCK;
 			DPRINTF(1, ("%s set gps_clockstate to INVALID_CLOCK\n",
 				refnumtoa(&peer->srcadr)));
+			LOGIF(CLOCKINFO, (LOG_NOTICE, "%s bad rdata.base '%s'",
+			      refnumtoa(&peer->srcadr), rdata.base));
 			if (up->bc635_clock_state == BCS_TIME_PPS_SYNCHRONIZED) {
-				DPRINTF(1, ("%s downgrade bc635_clockstate from PPS_SYNCHRONIZED to FREE_RUNNING\n",
+				LOGIF(CLOCKINFO, (LOG_NOTICE, "%s invalid clock, downgrade from PPS_SYNCHRONIZED to FREE_RUNNING '%s'",
+				      refnumtoa(&peer->srcadr), rdata.base));
+				DPRINTF(1, ("%s invalid clock, downgrade bc635_clockstate from PPS_SYNCHRONIZED to FREE_RUNNING\n",
 					refnumtoa(&peer->srcadr)));
+				log_lastcode++;
 				up->bc635_clock_state = BCS_TIME_FREE_RUNNING;
 				up->bc635_time_locked_count = 0;
 				peer->precision = FREE_PRECISION;
@@ -923,8 +954,13 @@ gpssymm_receive(
 		 * the UBLOX unit will not report correct time if it hasn't acquired leap seconds.
 		 */
 		if (up->gps_leap_seconds == 0 && up->gps_type == NMEA_GPS_NEO7_UBLOX) {
+			LOGIF(CLOCKINFO, (LOG_NOTICE, "%s rdata.base='%s'",
+			      refnumtoa(&peer->srcadr), rdata.base));
+			LOGIF(CLOCKINFO, (LOG_NOTICE, "%s UBLOX7 device, need leap seconds info, sending PUBX,04",
+			      refnumtoa(&peer->srcadr)));
 			DPRINTF(1, ("%s UBLOX7 and no leap seconds yet, sending PUBX,04 request\n",
 				refnumtoa(&peer->srcadr)));
+			log_lastcode++;
 			up->gps_clock_state = CS_WAIT_CLOCK_LEAP_SECS;
 			gps_send(pp->io.fd, "$PUBX,04*37\r\n", peer);
 			return;
@@ -939,9 +975,14 @@ gpssymm_receive(
 	case NMEA_PUBX:
 		DPRINTF(1, ("%s processing PUBX, timecode '%s'\n",
 			refnumtoa(&peer->srcadr), rd_lastcode));
+		DPRINTF(1, ("%s processing PUBX, rdata.base '%s'\n",
+			refnumtoa(&peer->srcadr), rdata.base));
 		if (up->gps_clock_state == CS_WAIT_CLOCK_LEAP_SECS) {
 			float gps_week_secs;
 			char comma;
+			int leap_seconds;
+			LOGIF(CLOCKINFO, (LOG_NOTICE, "%s UBLOX7 PUBX: '%s'",
+			      refnumtoa(&peer->srcadr), rdata.base));
 			cp = field_parse(&rdata, 4);
 			if (sscanf(cp, "%f%c", &gps_week_secs, &comma) != 2 || comma != ',') {
 				DPRINTF(1, ("%s bad field for gps_week_seconds\n",
@@ -973,17 +1014,19 @@ gpssymm_receive(
 				return;
 			}
 			cp = field_parse(&rdata, 6);
-			if (sscanf(cp, "%d%c", &up->gps_leap_seconds, &comma) != 2) {
+			if (sscanf(cp, "%d%c", &leap_seconds, &comma) != 2) {
 				DPRINTF(1, ("%s bad field for gps_leap_seconds\n",
 					refnumtoa(&peer->srcadr)));
 				refclock_report(peer, CEVNT_BADREPLY);
 				return;
 			}
 			DPRINTF(1, ("%s gps_leap_seconds = %d\n",
-				refnumtoa(&peer->srcadr), up->gps_leap_seconds));
+				refnumtoa(&peer->srcadr), leap_seconds));
 			if (comma == 'D') {
-				DPRINTF(1, ("%s gps_leap_seconds is still stored firmware value\n",
-					refnumtoa(&peer->srcadr)));
+				LOGIF(CLOCKINFO, (LOG_NOTICE, "%s UBLOX7 PUBX still has stored firmware value: %dD",
+				      refnumtoa(&peer->srcadr), leap_seconds));
+				DPRINTF(1, ("%s gps_leap_seconds is still stored firmware value %dD\n",
+					refnumtoa(&peer->srcadr), leap_seconds));
 				return;
 			}
 			if (comma != ',') {
@@ -992,6 +1035,10 @@ gpssymm_receive(
 				refclock_report(peer, CEVNT_BADREPLY);
 				return;
 			}
+			up->gps_leap_seconds = leap_seconds;
+			LOGIF(CLOCKINFO, (LOG_NOTICE, "%s UBLOX7 PUBX now has correct gps leap seconds: %d",
+			      refnumtoa(&peer->srcadr), up->gps_leap_seconds));
+			log_lastcode++;
 			DPRINTF(1, ("%s PUBX,04 valid, gps leap seconds %d - gps clock valid\n",
 				refnumtoa(&peer->srcadr), up->gps_leap_seconds));
 			clock_gettime(CLOCK_REALTIME, &up->gps_info_reftime);
@@ -1040,8 +1087,31 @@ gpssymm_receive(
 		gps_curr_tm.tm_min,
 		gps_curr_tm.tm_sec,
 		gps_unix_time));
+	if (log_lastcode) {
+		LOGIF(CLOCKINFO, (LOG_NOTICE, "%s effective timecode: %04u-%02u-%02u %02d:%02d:%02d [UNIX:%ld]\n",
+		      refnumtoa(&peer->srcadr),
+		gps_curr_tm.tm_year + YEAR_1900,
+		gps_curr_tm.tm_mon + 1,
+		gps_curr_tm.tm_mday,
+		gps_curr_tm.tm_hour,
+		gps_curr_tm.tm_min,
+		gps_curr_tm.tm_sec,
+		gps_unix_time));
+	}
 
 	up->gps_tally.bc_time_processed++;
+
+	if (up->log != NULL && up->bc635_clock_state == BCS_PRE_INITIALIZED) {
+		fprintf(up->log,
+		        "GSYM %u%u %d %d %d %d #%d\n",
+			((pp->leap >> 1) & 01),
+			(pp->leap & 01),
+			0,
+			0,
+			up->gps_clock_state,
+			up->bc635_clock_state,
+			up->bc635_time_locked_count);
+	}
 
 	switch (up->bc635_clock_state) {
 	case BCS_PRE_INITIALIZED:
@@ -1052,6 +1122,9 @@ gpssymm_receive(
 		memset(&btfp, 0, sizeof (btfp));
 		btfp.set_unixtime.unix_time = (uint32_t)gps_unix_time;
 		clock_gettime(CLOCK_REALTIME, &t);
+		LOGIF(CLOCKINFO, (LOG_NOTICE, "%s PRE_INITIALIZED: setting unix time to %ld",
+		      refnumtoa(&peer->srcadr), t.tv_sec));
+		log_lastcode++;
 		DPRINTF(1, ("%s clock_state: %ld.%09ld: set_unix_time\n", refnumtoa(&peer->srcadr), t.tv_sec, t.tv_nsec));
 		ret = ioctl(up->bc635_fd, BTFP_WRITE_UNIX_TIME, &btfp);
 		clock_gettime(CLOCK_REALTIME, &t);
@@ -1069,6 +1142,9 @@ gpssymm_receive(
 			       &up->last_t_clocktime,
 			       &locked,
 			       &timewarp);
+		LOGIF(CLOCKINFO, (LOG_NOTICE, "%s TIME_INITIALIZED: #%d, locked=%d, timewarp=%d",
+		      refnumtoa(&peer->srcadr), up->bc635_time_locked_count, locked, timewarp));
+		log_lastcode++;
 
 		up->bc635_time_initialized_count++;
 		if (locked && !timewarp) {
@@ -1077,11 +1153,15 @@ gpssymm_receive(
 			up->bc635_time_locked_count = 0;
 		}
 		if (up->bc635_time_locked_count >= BC635_MIN_LOCKED_COUNT) {
+			DPRINTF(1, ("%s clock_state: TIME INITIALIZED -- locked count ok\n", refnumtoa(&peer->srcadr)));
 			up->bc635_clock_state = BCS_TIME_PPS_SYNCHRONIZED;
 			peer->precision = LOCKED_PRECISION;
-			/* refclock_report(peer, CEVNT_NOMINAL); */
+			LOGIF(CLOCKINFO, (LOG_NOTICE, "%s TIME_SYNCHRONIZED: #%d, locked=%d, timewarp=%d: %ld.%09ld, %ld.%09ld",
+			      refnumtoa(&peer->srcadr), up->bc635_time_locked_count, locked, timewarp, up->last_bc635_t_reftime.tv_sec, up->last_bc635_t_reftime.tv_nsec, up->last_t_clocktime.tv_sec, up->last_t_clocktime.tv_nsec));
 		} else if (up->bc635_time_initialized_count >= BC635_MIN_LOCKED_COUNT * 3) {
-			DPRINTF(1, ("%s clock_state: LOCK TIMEOUT -- reset to beginning\n", refnumtoa(&peer->srcadr)));
+			LOGIF(CLOCKINFO, (LOG_NOTICE, "%s TIME_INITIALIZED: #%d, locked=%d, timewarp=%d: timeout",
+			      refnumtoa(&peer->srcadr), up->bc635_time_locked_count, locked, timewarp));
+			DPRINTF(1, ("%s clock_state: TIME INITIALIZED -- locked count timeout\n", refnumtoa(&peer->srcadr)));
 			up->gps_clock_state = CS_INVALID_CLOCK;
 			up->bc635_clock_state = BCS_PRE_INITIALIZED;
 			refclock_report(peer, CEVNT_BADREPLY);
@@ -1108,6 +1188,9 @@ gpssymm_receive(
 			up->bc635_time_locked_count = 0;
 			up->bc635_clock_state = BCS_TIME_FREE_RUNNING;
 			peer->precision = FREE_PRECISION;
+			LOGIF(CLOCKINFO, (LOG_NOTICE, "%s FREE_RUNNING: #%d, locked=%d, timewarp=%d: lost lock, now freerunning %ld.%09ld, %ld.%09ld",
+			      refnumtoa(&peer->srcadr), up->bc635_time_locked_count, locked, timewarp, up->last_bc635_t_reftime.tv_sec, up->last_bc635_t_reftime.tv_nsec, up->last_t_clocktime.tv_sec, up->last_t_clocktime.tv_nsec));
+			log_lastcode++;
 		}
 		break;
 	case BCS_TIME_FREE_RUNNING:
@@ -1127,6 +1210,9 @@ gpssymm_receive(
 			up->bc635_time_locked_count++;
 			up->bc635_clock_state = BCS_TIME_PPS_SYNCHRONIZED;
 			peer->precision = LOCKED_PRECISION;
+			LOGIF(CLOCKINFO, (LOG_NOTICE, "%s PPS_SYNCHRONIZED: #%d, locked=%d, timewarp=%d: now locked %ld.%09ld, %ld.%09ld",
+			      refnumtoa(&peer->srcadr), up->bc635_time_locked_count, locked, timewarp, up->last_bc635_t_reftime.tv_sec, up->last_bc635_t_reftime.tv_nsec, up->last_t_clocktime.tv_sec, up->last_t_clocktime.tv_nsec));
+			log_lastcode++;
 		} else {
 			up->bc635_time_locked_count = 0;
 			up->bc635_clock_state = BCS_TIME_FREE_RUNNING;
@@ -1142,6 +1228,18 @@ gpssymm_receive(
 
 	DPRINTF(1, ("%s using '%s' [UNIX: %ld]\n",
 		    refnumtoa(&peer->srcadr), rd_lastcode, gps_unix_time));
+
+	if (log_lastcode) {
+		LOGIF(CLOCKINFO, (LOG_NOTICE, "%s effective timecode: %04u-%02u-%02u %02d:%02d:%02d [UNIX:%ld]\n",
+		      refnumtoa(&peer->srcadr),
+		gps_curr_tm.tm_year + YEAR_1900,
+		gps_curr_tm.tm_mon + 1,
+		gps_curr_tm.tm_mday,
+		gps_curr_tm.tm_hour,
+		gps_curr_tm.tm_min,
+		gps_curr_tm.tm_sec,
+		gps_unix_time));
+	}
 
 	/* Data will be accepted. Update stats & log data. */
 	save_ltc(pp, rd_lastcode, rd_lencode);
@@ -1492,13 +1590,29 @@ parse_qual(
 	int         inv
 	)
 {
-	static const u_char table[2] =
-				{ LEAP_NOTINSYNC, LEAP_NOWARNING };
-	char * dp;
-
-	dp = field_parse(rd, idx);
-	
+	static const u_char table[2] = { LEAP_NOTINSYNC, LEAP_NOWARNING };
+	char *dp = field_parse(rd, idx);
 	return table[ *dp && ((*dp == tag) == !inv) ];
+}
+
+/*
+ * -------------------------------------------------------------------
+ * like the above, but check that the field is either tag or tag2
+ * no inverse checking
+ * -------------------------------------------------------------------
+ */
+static u_char
+parse_qual2(
+	gpssymm_data * rd,
+	int         idx,
+	char        tag,
+	char        tag2
+	)
+{
+	static const u_char table[2] = { LEAP_NOTINSYNC, LEAP_NOWARNING };
+	char *dp = field_parse(rd, idx);
+	// DPRINTF(1, ("parse_qual2, *dp='%c', tag=%c, tag2=%c\n", *dp, tag, tag2));
+	return table[ *dp && ((*dp == tag) || (*dp == tag2)) ];
 }
 
 /*
